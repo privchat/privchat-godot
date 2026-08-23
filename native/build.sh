@@ -3,12 +3,50 @@
 # 1. cargo build privchat-sdk-c-api (release cdylib)
 # 2. scons the godot-cpp extension against it
 # 3. stage both dylibs + gdextension into addons/privchat/
+#
+# privchat-sdk location resolution order:
+#   1. $SDK_REPO environment variable
+#   2. <repo-root>/../privchat-sdk (sibling checkout)
+#   3. $HOME/projects/privchat/privchat-sdk (monorepo layout)
 set -euo pipefail
 
 NATIVE_DIR="$(cd "$(dirname "$0")" && pwd)"
-SDK_REPO="/Users/zoujiaqing/projects/privchat/privchat-sdk"
-ADDON_DIR="$(cd "$NATIVE_DIR/.." && pwd)/addons/privchat"
+REPO_ROOT="$(cd "$NATIVE_DIR/.." && pwd)"
+ADDON_DIR="$REPO_ROOT/addons/privchat"
 BIN_DIR="$ADDON_DIR/bin"
+
+resolve_sdk_repo() {
+    if [ -n "${SDK_REPO:-}" ]; then
+        echo "$SDK_REPO"
+        return
+    fi
+    local cand
+    for cand in "$REPO_ROOT/../privchat-sdk" "$HOME/projects/privchat/privchat-sdk"; do
+        if [ -f "$cand/Cargo.toml" ] && [ -d "$cand/crates/privchat-sdk-c-api" ]; then
+            echo "$cand"
+            return
+        fi
+    done
+    echo ""
+}
+
+SDK_REPO="$(resolve_sdk_repo)"
+if [ -z "$SDK_REPO" ] || [ ! -d "$SDK_REPO" ]; then
+    echo "ERROR: could not locate the privchat-sdk repository" >&2
+    echo "(SDK_REPO=${SDK_REPO:-<unset>})." >&2
+    echo "Searched: \$SDK_REPO, $REPO_ROOT/../privchat-sdk," >&2
+    echo "          $HOME/projects/privchat/privchat-sdk" >&2
+    echo "Fix: export SDK_REPO=/path/to/privchat-sdk and re-run." >&2
+    exit 1
+fi
+SDK_REPO="$(cd "$SDK_REPO" && pwd)"
+export SDK_REPO
+echo "==> using privchat-sdk at $SDK_REPO"
+
+# Ensure the vendored godot-cpp dependency is present (clean-clone support).
+if [ ! -f "$NATIVE_DIR/godot-cpp/SConstruct" ]; then
+    "$REPO_ROOT/scripts/setup.sh"
+fi
 
 echo "==> cargo build privchat-sdk-c-api (release)"
 cargo build --release -p privchat-sdk-c-api --manifest-path "$SDK_REPO/Cargo.toml"

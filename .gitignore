@@ -1,8 +1,9 @@
 # Godot engine cache
 .godot/
 
-# godot-cpp is a vendored clone of godotengine/godot-cpp (godot-4.5-stable),
-# restored via: git clone --depth 1 -b godot-4.5-stable https://github.com/godotengine/godot-cpp.git
+# godot-cpp is restored by scripts/setup.sh (pinned: branch 4.5 @ 60b5a41,
+# https://github.com/godotengine/godot-cpp.git). Kept out of git to avoid
+# vendoring ~270M of upstream sources.
 native/godot-cpp/
 
 # scons build intermediates

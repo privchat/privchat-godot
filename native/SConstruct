@@ -1,11 +1,37 @@
 #!/usr/bin/env python
 # SConstruct for the privchat GDExtension (wraps privchat-sdk-c-api).
+import os
 import sys
 
 env = SConscript("godot-cpp/SConstruct")
 
-SDK_INCLUDE = "/Users/zoujiaqing/projects/privchat/privchat-sdk/crates/privchat-sdk-c-api/include"
-SDK_LIB_DIR = "/Users/zoujiaqing/projects/privchat/privchat-sdk/target/release"
+# privchat-sdk location: scons CLI var > $SDK_REPO env (set by build.sh) >
+# sibling checkout of this repository. SDK_INCLUDE / SDK_LIB_DIR may be
+# overridden independently for unusual layouts.
+sdk_repo = ARGUMENTS.get("SDK_REPO", os.environ.get("SDK_REPO", ""))
+if not sdk_repo:
+    sdk_repo = os.path.abspath(os.path.join(os.getcwd(), "..", "..", "privchat-sdk"))
+
+SDK_INCLUDE = ARGUMENTS.get(
+    "SDK_INCLUDE",
+    os.environ.get(
+        "SDK_INCLUDE",
+        os.path.join(sdk_repo, "crates", "privchat-sdk-c-api", "include"),
+    ),
+)
+SDK_LIB_DIR = ARGUMENTS.get(
+    "SDK_LIB_DIR",
+    os.environ.get("SDK_LIB_DIR", os.path.join(sdk_repo, "target", "release")),
+)
+
+if not os.path.isfile(os.path.join(SDK_INCLUDE, "privchat_sdk_c_api.h")):
+    print(
+        "ERROR: privchat_sdk_c_api.h not found under %s\n"
+        "Fix: run via native/build.sh, or pass SDK_REPO=/path/to/privchat-sdk "
+        "(or SDK_INCLUDE=... SDK_LIB_DIR=...) to scons." % SDK_INCLUDE,
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 env.Append(CPPPATH=["#include", "#src", SDK_INCLUDE])
 
