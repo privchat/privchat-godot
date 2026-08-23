@@ -1,0 +1,34 @@
+#!/usr/bin/env python
+# SConstruct for the privchat GDExtension (wraps privchat-sdk-c-api).
+import sys
+
+env = SConscript("godot-cpp/SConstruct")
+
+SDK_INCLUDE = "/Users/zoujiaqing/projects/privchat/privchat-sdk/crates/privchat-sdk-c-api/include"
+SDK_LIB_DIR = "/Users/zoujiaqing/projects/privchat/privchat-sdk/target/release"
+
+env.Append(CPPPATH=["#include", "#src", SDK_INCLUDE])
+
+if env["platform"] == "macos":
+    # Godot engine 4.3+ requires C++17.
+    env.Append(CCFLAGS=["-std=c++17"])
+    # Link the Rust c-api dylib; @loader_path lets us ship it next to the
+    # extension binary (build.sh copies it into addons/privchat/bin).
+    env.Append(LINKFLAGS=[
+        "-Wl,-rpath,@loader_path",
+        "-Wl,-rpath," + SDK_LIB_DIR,
+    ])
+    env.Append(LIBPATH=[SDK_LIB_DIR])
+    env.Append(LIBS=["privchat_sdk_c_api"])
+
+    library = env.SharedLibrary(
+        target="../addons/privchat/bin/libprivchat_godot.{}.{}.dylib".format(
+            env["platform"], env["target"]
+        ),
+        source=Glob("src/*.cpp"),
+    )
+else:
+    print("Only macOS targets are supported in this phase.")
+    sys.exit(1)
+
+Default(library)

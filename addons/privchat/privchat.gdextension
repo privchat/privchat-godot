@@ -1,0 +1,10 @@
+[configuration]
+
+entry_symbol = "privchat_library_init"
+compatibility_minimum = "4.3"
+reloadable = false
+
+[libraries]
+
+macos.arm64 = "res://addons/privchat/bin/libprivchat_godot.macos.template_release.dylib"
+macos.x86_64 = "res://addons/privchat/bin/libprivchat_godot.macos.template_release.dylib"

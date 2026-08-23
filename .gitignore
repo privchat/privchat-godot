@@ -1,0 +1,13 @@
+# Godot engine cache
+.godot/
+
+# godot-cpp is a vendored clone of godotengine/godot-cpp (godot-4.5-stable),
+# restored via: git clone --depth 1 -b godot-4.5-stable https://github.com/godotengine/godot-cpp.git
+native/godot-cpp/
+
+# scons build intermediates
+native/*.os
+native/src/*.os
+
+# macOS noise
+.DS_Store
