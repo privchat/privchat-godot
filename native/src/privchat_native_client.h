@@ -4,11 +4,16 @@
 // - All blocking SDK calls run on a dedicated worker thread (task queue).
 // - Results and polled SDK events are marshalled back to the main thread
 //   via a mutex-guarded result queue drained in _process(), then emitted
-//   as signals. JSON strings cross every boundary; no SDK types leak into
-//   GDScript.
+//   as signals.
+//
+// Serialization boundary: JSON strings exist ONLY between this class and
+// the C ABI. GDScript-facing params/results/signals are Dictionary/Array/
+// Variant — stringify/parse happens here, exactly once.
 #pragma once
 
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -107,8 +112,8 @@ protected:
 
 public:
     // --- lifecycle -----------------------------------------------------
-    // config_json: serialized PrivchatConfig (see privchat_sdk_c_api.h).
-    bool initialize(const String &config_json);
+    // config: PrivchatConfig shape (see privchat_sdk_c_api.h); serialized here.
+    bool initialize(const Dictionary &config);
     void shutdown();
     bool is_initialized() const;
 
@@ -120,8 +125,8 @@ public:
     uint64_t subscribe_channel(uint64_t channel_id, int64_t channel_type, const String &token, int64_t timeout_ms);
     uint64_t unsubscribe_channel(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
     uint64_t send_text_message(uint64_t channel_id, int64_t channel_type, uint64_t from_uid, const String &content, int64_t timeout_ms);
-    uint64_t transfer(uint64_t channel_id, const String &route, const String &body, int64_t timeout_ms);
-    uint64_t rpc_call(const String &route, const String &body_json, int64_t timeout_ms);
+    uint64_t transfer(uint64_t channel_id, const String &route, const Dictionary &body, int64_t timeout_ms);
+    uint64_t rpc_call(const String &route, const Dictionary &body, int64_t timeout_ms);
     uint64_t sync_channel(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
     uint64_t get_message_by_id(uint64_t message_id, int64_t timeout_ms);
 
@@ -137,8 +142,8 @@ public:
 
     // --- sync getters (short blocking calls, main-thread safe) ---------
     String connection_state_sync(int64_t timeout_ms);
-    String session_snapshot_sync(int64_t timeout_ms);
-    String recent_events_sync(int64_t limit);
+    Dictionary session_snapshot_sync(int64_t timeout_ms);
+    Array recent_events_sync(int64_t limit);
 
     PrivchatNativeClient();
     ~PrivchatNativeClient();

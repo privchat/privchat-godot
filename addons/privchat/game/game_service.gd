@@ -45,7 +45,7 @@ func join(channel_id: int, ticket: String) -> Dictionary:
 
 func leave() -> Dictionary:
 	if game_channel_id == 0:
-		return { "ok": true, "error": "", "payload": "" }
+		return { "ok": true, "error": "", "data": null }
 	var resp: Dictionary = await client.unsubscribe_channel(
 			game_channel_id, ROOM_CHANNEL_TYPE)
 	game_channel_id = 0
@@ -67,31 +67,32 @@ func send_command(route: String, payload: Dictionary = {},
 	var body := payload.duplicate()
 	body["request_id"] = request_id
 	var resp: Dictionary = await client.transfer(
-			game_channel_id, route, JSON.stringify(body), timeout_ms)
+			game_channel_id, route, body, timeout_ms)
 	return _parse_transfer(resp, request_id)
 
 
 ## 全局 RPC 透传(名字避开 Node 内建 rpc())。返回 { ok, data: Dictionary, error }。
 func call_rpc(route: String, body: Dictionary = {}, timeout_ms: int = 8000) -> Dictionary:
-	var resp: Dictionary = await client.rpc_call(route, JSON.stringify(body), timeout_ms)
-	var out := { "ok": resp.ok, "data": {}, "error": resp.get("error", "") }
-	if resp.ok and not String(resp.payload).is_empty():
-		var parsed = JSON.parse_string(resp.payload)
-		if typeof(parsed) == TYPE_DICTIONARY:
-			out.data = parsed
-	return out
+	var resp: Dictionary = await client.rpc_call(route, body, timeout_ms)
+	return {
+		"ok": resp.ok,
+		"data": resp.data if typeof(resp.data) == TYPE_DICTIONARY else {},
+		"error": resp.get("error", ""),
+	}
 
 
-## transfer 回包:{"request_id","channel_id","code","message","data"};
-## data 为 UTF-8 时是字符串(通常是 JSON 文本),否则是字节数组。
+## transfer 信封:{"request_id","channel_id","code","message","data"}。
+## 信封本身已由 native 层解析成 Dictionary;信封内的 data 是服务端业务
+## 载荷 —— 协议层面是字节,UTF-8 JSON 时在这里解析成对象(本层是
+## 载荷格式的收敛点,上层业务只见 Dictionary)。
 func _parse_transfer(resp: Dictionary, request_id: int) -> Dictionary:
 	var out := { "ok": false, "code": -1, "data": {}, "error": resp.get("error", ""),
 			"request_id": request_id }
 	if not resp.ok:
 		return out
-	var envelope = JSON.parse_string(resp.payload)
+	var envelope = resp.data
 	if typeof(envelope) != TYPE_DICTIONARY:
-		out.error = "bad transfer envelope: %s" % str(resp.payload)
+		out.error = "bad transfer envelope: %s" % str(envelope)
 		return out
 	out.code = int(envelope.get("code", -1))
 	out.ok = out.code == 0
@@ -109,13 +110,10 @@ func _parse_transfer(resp: Dictionary, request_id: int) -> Dictionary:
 
 # --- 事件分发 ---------------------------------------------------------------
 
-func _on_sdk_event(_seq: int, _ts: int, kind: String, event_json: String) -> void:
+func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void:
 	if kind != "SubscriptionMessageReceived":
 		return
-	var parsed = JSON.parse_string(event_json)
-	if typeof(parsed) != TYPE_DICTIONARY:
-		return
-	var body = parsed.get("event", {}).get("SubscriptionMessageReceived", {})
+	var body = event.get("event", {}).get("SubscriptionMessageReceived", {})
 	if typeof(body) != TYPE_DICTIONARY:
 		return
 	if int(body.get("channel_id", -1)) != game_channel_id:

@@ -91,7 +91,7 @@ func join_room(p_room_channel_id: int, ticket: String) -> Dictionary:
 
 func leave_room() -> Dictionary:
 	if room_channel_id == 0:
-		return { "ok": true, "error": "", "payload": "" }
+		return { "ok": true, "error": "", "data": null }
 	var resp: Dictionary = await client.unsubscribe_channel(room_channel_id, ROOM_CHANNEL_TYPE)
 	room_channel_id = 0
 	_seen_room_ids.clear()
@@ -100,18 +100,18 @@ func leave_room() -> Dictionary:
 
 # --- 事件分发 ---------------------------------------------------------------
 
-func _on_sdk_event(_seq: int, _ts: int, kind: String, event_json: String) -> void:
+func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void:
 	match kind:
 		"TimelineUpdated":
-			_handle_timeline(event_json)
+			_handle_timeline(event)
 		"MessageSendStatusChanged":
-			_handle_send_status(event_json)
+			_handle_send_status(event)
 		"SubscriptionMessageReceived":
-			_handle_room_broadcast(event_json)
+			_handle_room_broadcast(event)
 
 
-func _handle_timeline(event_json: String) -> void:
-	var body := _event_body(event_json, "TimelineUpdated")
+func _handle_timeline(event: Dictionary) -> void:
+	var body := _event_body(event, "TimelineUpdated")
 	if int(body.get("channel_id", -1)) != channel_id:
 		return
 	# 只把「新消息落库」转成 message_received;sync/回执等 reason 不重复弹消息。
@@ -125,15 +125,15 @@ func _handle_timeline(event_json: String) -> void:
 		return
 	_seen_timeline[key] = true
 	var resp: Dictionary = await client.get_message_by_id(message_id)
-	if resp.ok and resp.has("data"):
+	if resp.ok and typeof(resp.data) == TYPE_DICTIONARY:
 		message_received.emit(resp.data)
 	var unread: Dictionary = await client.get_channel_unread_count(channel_id, channel_type)
 	if unread.ok:
 		unread_changed.emit(channel_id, unread.count)
 
 
-func _handle_send_status(event_json: String) -> void:
-	var body := _event_body(event_json, "MessageSendStatusChanged")
+func _handle_send_status(event: Dictionary) -> void:
+	var body := _event_body(event, "MessageSendStatusChanged")
 	if body.is_empty():
 		return
 	send_status_changed.emit(int(body.get("message_id", 0)),
@@ -141,8 +141,8 @@ func _handle_send_status(event_json: String) -> void:
 			int(body.get("server_message_id", 0) if body.get("server_message_id") != null else 0))
 
 
-func _handle_room_broadcast(event_json: String) -> void:
-	var body := _event_body(event_json, "SubscriptionMessageReceived")
+func _handle_room_broadcast(event: Dictionary) -> void:
+	var body := _event_body(event, "SubscriptionMessageReceived")
 	if int(body.get("channel_id", -1)) != room_channel_id:
 		return
 	var server_message_id: int = int(body.get("server_message_id", 0) \
@@ -160,11 +160,8 @@ func _handle_room_broadcast(event_json: String) -> void:
 
 
 ## 外部标签枚举:{"event":{"Kind":{...}}};unit 变体是 {"event":"Kind"}。
-func _event_body(event_json: String, kind: String) -> Dictionary:
-	var parsed = JSON.parse_string(event_json)
-	if typeof(parsed) != TYPE_DICTIONARY:
-		return {}
-	var ev = parsed.get("event", {})
+func _event_body(event: Dictionary, kind: String) -> Dictionary:
+	var ev = event.get("event", {})
 	if typeof(ev) != TYPE_DICTIONARY:
 		return {}
 	var body = ev.get(kind, {})

@@ -46,11 +46,12 @@ void PrivchatNativeClient::_notification(int p_what) {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-bool PrivchatNativeClient::initialize(const String &config_json) {
+bool PrivchatNativeClient::initialize(const Dictionary &config) {
     std::lock_guard<std::mutex> lock(client_mutex);
     if (initialized) {
         return true;
     }
+    const String config_json = JSON::stringify(config);
     PrivchatCapiClient *c = privchat_capi_client_create(config_json.utf8().get_data());
     if (c == nullptr) {
         const char *err = privchat_capi_last_error();
@@ -399,8 +400,14 @@ void PrivchatNativeClient::drain_results() {
         pending.swap(result_queue);
     }
     for (const TaskResult &r : pending) {
+        // Serialization boundary: the JSON payload from the C ABI is parsed
+        // exactly once here; GDScript receives a Dictionary/Array/null Variant.
+        Variant data;
+        if (!r.payload.empty()) {
+            data = JSON::parse_string(String::utf8(r.payload.c_str()));
+        }
         emit_signal("request_completed", (int64_t)r.request_id, (int64_t)r.kind,
-                r.ok, String::utf8(r.payload.c_str()), String::utf8(r.error.c_str()));
+                r.ok, data, String::utf8(r.error.c_str()));
         if (r.kind == TaskKind::SendText) {
             emit_signal("message_sent", (int64_t)r.request_id, r.ok,
                     (int64_t)r.message_id, String::utf8(r.error.c_str()));
@@ -466,13 +473,8 @@ void PrivchatNativeClient::poll_events() {
         if (sequence_id > (int64_t)event_cursor.load()) {
             event_cursor.store((uint64_t)sequence_id);
         }
-        String event_json;
-        {
-            // Re-serialize the single sequenced event for GDScript consumers.
-            Variant single = seq_event;
-            event_json = JSON::stringify(single);
-        }
-        emit_signal("sdk_event", sequence_id, timestamp_ms, kind, event_json);
+        // Already parsed once above — hand the Dictionary straight to GDScript.
+        emit_signal("sdk_event", sequence_id, timestamp_ms, kind, seq_event);
     }
 }
 
@@ -546,22 +548,22 @@ uint64_t PrivchatNativeClient::send_text_message(uint64_t channel_id, int64_t ch
 }
 
 uint64_t PrivchatNativeClient::transfer(uint64_t channel_id, const String &route,
-        const String &body, int64_t timeout_ms) {
+        const Dictionary &body, int64_t timeout_ms) {
     Task t;
     t.kind = TaskKind::Transfer;
     t.u64_a = channel_id;
     t.str_a = to_std(route);
-    t.str_b = to_std(body);
+    t.str_b = to_std(JSON::stringify(body));
     t.u64_b = (uint64_t)timeout_ms;
     return enqueue_task(std::move(t));
 }
 
-uint64_t PrivchatNativeClient::rpc_call(const String &route, const String &body_json,
+uint64_t PrivchatNativeClient::rpc_call(const String &route, const Dictionary &body,
         int64_t timeout_ms) {
     Task t;
     t.kind = TaskKind::RpcCall;
     t.str_a = to_std(route);
-    t.str_b = to_std(body_json);
+    t.str_b = to_std(JSON::stringify(body));
     t.u64_b = (uint64_t)timeout_ms;
     return enqueue_task(std::move(t));
 }
@@ -680,40 +682,42 @@ String PrivchatNativeClient::connection_state_sync(int64_t timeout_ms) {
     return parsed.get_type() == Variant::STRING ? String(parsed) : result;
 }
 
-String PrivchatNativeClient::session_snapshot_sync(int64_t timeout_ms) {
+Dictionary PrivchatNativeClient::session_snapshot_sync(int64_t timeout_ms) {
     PrivchatCapiClient *c = nullptr;
     {
         std::lock_guard<std::mutex> lock(client_mutex);
         c = client;
     }
     if (c == nullptr) {
-        return "";
+        return Dictionary();
     }
     char *out = privchat_capi_session_snapshot(c, (uint64_t)timeout_ms);
     if (out == nullptr) {
-        return "";
+        return Dictionary();
     }
-    String result = String::utf8(out);
+    String raw = String::utf8(out);
     privchat_capi_free_string(out);
-    return result;
+    Variant parsed = JSON::parse_string(raw);
+    return parsed.get_type() == Variant::DICTIONARY ? Dictionary(parsed) : Dictionary();
 }
 
-String PrivchatNativeClient::recent_events_sync(int64_t limit) {
+Array PrivchatNativeClient::recent_events_sync(int64_t limit) {
     PrivchatCapiClient *c = nullptr;
     {
         std::lock_guard<std::mutex> lock(client_mutex);
         c = client;
     }
     if (c == nullptr) {
-        return "[]";
+        return Array();
     }
     char *out = privchat_capi_recent_events(c, (uint64_t)limit);
     if (out == nullptr) {
-        return "[]";
+        return Array();
     }
-    String result = String::utf8(out);
+    String raw = String::utf8(out);
     privchat_capi_free_string(out);
-    return result;
+    Variant parsed = JSON::parse_string(raw);
+    return parsed.get_type() == Variant::ARRAY ? Array(parsed) : Array();
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +725,7 @@ String PrivchatNativeClient::recent_events_sync(int64_t limit) {
 // ---------------------------------------------------------------------------
 
 void PrivchatNativeClient::_bind_methods() {
-    ClassDB::bind_method(D_METHOD("initialize", "config_json"), &PrivchatNativeClient::initialize);
+    ClassDB::bind_method(D_METHOD("initialize", "config"), &PrivchatNativeClient::initialize);
     ClassDB::bind_method(D_METHOD("shutdown"), &PrivchatNativeClient::shutdown);
     ClassDB::bind_method(D_METHOD("is_initialized"), &PrivchatNativeClient::is_initialized);
 
@@ -741,7 +745,7 @@ void PrivchatNativeClient::_bind_methods() {
             &PrivchatNativeClient::send_text_message, DEFVAL((int64_t)10000));
     ClassDB::bind_method(D_METHOD("transfer", "channel_id", "route", "body", "timeout_ms"),
             &PrivchatNativeClient::transfer, DEFVAL((int64_t)8000));
-    ClassDB::bind_method(D_METHOD("rpc_call", "route", "body_json", "timeout_ms"),
+    ClassDB::bind_method(D_METHOD("rpc_call", "route", "body", "timeout_ms"),
             &PrivchatNativeClient::rpc_call, DEFVAL((int64_t)8000));
     ClassDB::bind_method(D_METHOD("sync_channel", "channel_id", "channel_type", "timeout_ms"),
             &PrivchatNativeClient::sync_channel, DEFVAL((int64_t)15000));
@@ -774,7 +778,8 @@ void PrivchatNativeClient::_bind_methods() {
             PropertyInfo(Variant::INT, "request_id"),
             PropertyInfo(Variant::INT, "kind"),
             PropertyInfo(Variant::BOOL, "ok"),
-            PropertyInfo(Variant::STRING, "payload"),
+            PropertyInfo(Variant::NIL, "data", PROPERTY_HINT_NONE, "",
+                    PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_NIL_IS_VARIANT),
             PropertyInfo(Variant::STRING, "error")));
     ADD_SIGNAL(MethodInfo("message_sent",
             PropertyInfo(Variant::INT, "request_id"),
@@ -785,7 +790,7 @@ void PrivchatNativeClient::_bind_methods() {
             PropertyInfo(Variant::INT, "sequence_id"),
             PropertyInfo(Variant::INT, "timestamp_ms"),
             PropertyInfo(Variant::STRING, "kind"),
-            PropertyInfo(Variant::STRING, "event_json")));
+            PropertyInfo(Variant::DICTIONARY, "event")));
     ADD_SIGNAL(MethodInfo("connection_state_changed",
             PropertyInfo(Variant::STRING, "from_state"),
             PropertyInfo(Variant::STRING, "to_state")));

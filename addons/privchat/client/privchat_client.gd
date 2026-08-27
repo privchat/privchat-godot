@@ -2,12 +2,16 @@
 #
 # GDScript facade over the PrivchatNativeClient GDExtension. Owns the
 # native client + platform auth client, exposes awaitable methods and
-# forwarded signals. GDScript never touches wire protocols — everything
-# crosses as JSON strings produced by privchat-sdk-c-api.
+# forwarded signals.
+#
+# 序列化边界:JSON 字符串只存在于 native ↔ C ABI 一线(在 C++ 里
+# stringify/parse 各一次)。本层及以上出入参、信号、返回值全部是
+# Dictionary / Array / 标量 —— GDScript 不接触 JSON 文本。
 class_name PrivchatClient
 extends Node
 
-signal sdk_event(sequence_id: int, timestamp_ms: int, kind: String, event_json: String)
+## SDK 事件(event 为已解析的 SequencedSdkEvent Dictionary)。
+signal sdk_event(sequence_id: int, timestamp_ms: int, kind: String, event: Dictionary)
 signal connection_state_changed(from_state: String, to_state: String)
 signal message_sent(request_id: int, ok: bool, message_id: int, error: String)
 
@@ -92,7 +96,7 @@ func start() -> bool:
 		"connection_timeout_secs": connection_timeout_secs,
 		"data_dir": ProjectSettings.globalize_path(data_dir),
 	}
-	var ok: bool = native.initialize(JSON.stringify(config))
+	var ok: bool = native.initialize(config)
 	if not ok:
 		push_error("[privchat] native initialize failed")
 	return ok
@@ -140,7 +144,8 @@ func send_sms_code(mobile: String) -> Dictionary:
 
 
 # ---------------------------------------------------------------------------
-# awaitable native operations (return { ok, payload, error })
+# awaitable native operations (return { ok, data, error })
+# data: 已解析的 Dictionary / Array / null,永远不是 JSON 字符串
 # ---------------------------------------------------------------------------
 
 func authenticate(user_id: int, access_token: String, device_id: String,
@@ -187,14 +192,17 @@ func send_text(channel_id: int, channel_type: int, content: String,
 	return await _await_request(rid)
 
 
-func transfer(channel_id: int, route: String, body_json: String,
+## Channel Transfer。body 是 Dictionary;返回 { ok, data, error },
+## data 为 transfer 信封 {"request_id","channel_id","code","message","data"}。
+func transfer(channel_id: int, route: String, body: Dictionary,
 		timeout_ms: int = 8000) -> Dictionary:
-	var rid: int = native.transfer(channel_id, route, body_json, timeout_ms)
+	var rid: int = native.transfer(channel_id, route, body, timeout_ms)
 	return await _await_request(rid)
 
 
-func rpc_call(route: String, body_json: String, timeout_ms: int = 8000) -> Dictionary:
-	var rid: int = native.rpc_call(route, body_json, timeout_ms)
+## 全局 RPC。body 是 Dictionary;返回 { ok, data, error },data 为服务端响应对象。
+func rpc_call(route: String, body: Dictionary, timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.rpc_call(route, body, timeout_ms)
 	return await _await_request(rid)
 
 
@@ -203,37 +211,30 @@ func sync_channel(channel_id: int, channel_type: int, timeout_ms: int = 15000) -
 	return await _await_request(rid)
 
 
-## Returns parsed StoredMessage Dictionary, or {} when not found.
+## 返回 { ok, data: StoredMessage Dictionary | null, error }。
 func get_message_by_id(message_id: int, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_message_by_id(message_id, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
-	if result.ok and not result.payload.is_empty():
-		var parsed = JSON.parse_string(result.payload)
-		if typeof(parsed) == TYPE_DICTIONARY:
-			result.data = parsed
-	return result
+	return await _await_request(rid)
 
 
 ## Direct-channel helper mirroring privchat-sdk-ffi
 ## get_or_create_direct_channel: rpc + one-shot channel sync.
 func get_or_create_direct_channel(peer_user_id: int) -> Dictionary:
-	var req := JSON.stringify({
+	var resp: Dictionary = await rpc_call("channel/direct/get_or_create", {
 		"target_user_id": peer_user_id,
 		"source": null,
 		"source_id": null,
 		"user_id": 0,
 	})
-	var resp: Dictionary = await rpc_call("channel/direct/get_or_create", req)
 	if not resp.ok:
 		return resp
-	var data = JSON.parse_string(resp.payload)
-	if typeof(data) != TYPE_DICTIONARY or not data.has("channel_id"):
-		return { "ok": false, "payload": resp.payload, "error": "unexpected direct-channel response" }
-	var channel_id: int = int(data.channel_id)
+	if typeof(resp.data) != TYPE_DICTIONARY or not resp.data.has("channel_id"):
+		return { "ok": false, "data": resp.data, "error": "unexpected direct-channel response" }
+	var channel_id: int = int(resp.data.channel_id)
 	var sync_result: Dictionary = await sync_channel(channel_id, 1)
 	if not sync_result.ok:
 		return sync_result
-	return { "ok": true, "payload": resp.payload, "error": "", "channel_id": channel_id }
+	return { "ok": true, "data": resp.data, "error": "", "channel_id": channel_id }
 
 
 # ---------------------------------------------------------------------------
@@ -241,11 +242,11 @@ func get_or_create_direct_channel(peer_user_id: int) -> Dictionary:
 # ---------------------------------------------------------------------------
 
 ## 打开会话(SDK-HISTORY-7):本地为渲染真源,本地为空补一次最新窗口。
-## 返回 { ok, error, messages: Array, has_more_before: bool, fetched_from_server: bool }。
+## 返回 { ok, error, messages: Array(显示序 DESC), has_more_before, fetched_from_server }。
 func open_conversation(channel_id: int, channel_type: int, limit: int = 50,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.open_conversation(channel_id, channel_type, limit, timeout_ms)
-	return _parse_page(await _await_request(rid))
+	return _page_view(await _await_request(rid))
 
 
 ## 上滑加载更早历史(SDK-HISTORY-5);has_more_before=false 即到顶(跨会话持久化)。
@@ -254,7 +255,7 @@ func load_older_history(channel_id: int, channel_type: int,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.load_older_history(channel_id, channel_type,
 			before_server_message_id, limit, timeout_ms)
-	return _parse_page(await _await_request(rid))
+	return _page_view(await _await_request(rid))
 
 
 ## 纯本地分页读(不触网)。返回 { ok, error, messages: Array }。
@@ -262,7 +263,7 @@ func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 		offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.list_messages(channel_id, channel_type, limit, offset, timeout_ms)
 	var result: Dictionary = await _await_request(rid)
-	result.messages = _parse_json_array(result)
+	result.messages = result.data if typeof(result.data) == TYPE_ARRAY else []
 	return result
 
 
@@ -271,7 +272,7 @@ func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.list_channels(limit, offset, timeout_ms)
 	var result: Dictionary = await _await_request(rid)
-	var channels := _parse_json_array(result)
+	var channels: Array = result.data if typeof(result.data) == TYPE_ARRAY else []
 	channels.sort_custom(func(a, b):
 		if int(a.get("top", 0)) != int(b.get("top", 0)):
 			return int(a.get("top", 0)) > int(b.get("top", 0))
@@ -285,7 +286,7 @@ func mark_read_to_pts(channel_id: int, read_pts: int,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.mark_read_to_pts(channel_id, read_pts, timeout_ms)
 	var result: Dictionary = await _await_request(rid)
-	result.last_read_pts = _payload_int(result, "last_read_pts")
+	result.last_read_pts = _data_int(result, "last_read_pts")
 	return result
 
 
@@ -294,7 +295,7 @@ func get_channel_unread_count(channel_id: int, channel_type: int,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_channel_unread_count(channel_id, channel_type, timeout_ms)
 	var result: Dictionary = await _await_request(rid)
-	result.count = _payload_int(result, "count")
+	result.count = _data_int(result, "count")
 	return result
 
 
@@ -303,7 +304,7 @@ func get_total_unread_count(exclude_muted: bool = false,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_total_unread_count(exclude_muted, timeout_ms)
 	var result: Dictionary = await _await_request(rid)
-	result.count = _payload_int(result, "count")
+	result.count = _data_int(result, "count")
 	return result
 
 
@@ -318,20 +319,13 @@ func connection_state(timeout_ms: int = 2000) -> String:
 func session_snapshot(timeout_ms: int = 2000) -> Dictionary:
 	if native == null:
 		return {}
-	var raw: String = native.session_snapshot_sync(timeout_ms)
-	var parsed = JSON.parse_string(raw)
-	if typeof(parsed) == TYPE_DICTIONARY:
-		return parsed
-	return {}
+	return native.session_snapshot_sync(timeout_ms)
 
 
 func recent_events(limit: int = 50) -> Array:
 	if native == null:
 		return []
-	var parsed = JSON.parse_string(native.recent_events_sync(limit))
-	if typeof(parsed) == TYPE_ARRAY:
-		return parsed
-	return []
+	return native.recent_events_sync(limit)
 
 
 # ---------------------------------------------------------------------------
@@ -344,33 +338,18 @@ func _ensure_started() -> bool:
 	return start()
 
 
-## 解析 { messages, has_more_before, ... } 形状的分页 payload。
-func _parse_page(result: Dictionary) -> Dictionary:
-	result.messages = []
-	result.has_more_before = false
-	result.fetched_from_server = false
-	if result.ok and not String(result.payload).is_empty():
-		var parsed = JSON.parse_string(result.payload)
-		if typeof(parsed) == TYPE_DICTIONARY:
-			result.messages = parsed.get("messages", [])
-			result.has_more_before = bool(parsed.get("has_more_before", false))
-			result.fetched_from_server = bool(parsed.get("fetched_from_server", false))
+## { messages, has_more_before, fetched_from_server } 分页视图。
+func _page_view(result: Dictionary) -> Dictionary:
+	var page: Dictionary = result.data if typeof(result.data) == TYPE_DICTIONARY else {}
+	result.messages = page.get("messages", [])
+	result.has_more_before = bool(page.get("has_more_before", false))
+	result.fetched_from_server = bool(page.get("fetched_from_server", false))
 	return result
 
 
-func _parse_json_array(result: Dictionary) -> Array:
-	if result.ok and not String(result.payload).is_empty():
-		var parsed = JSON.parse_string(result.payload)
-		if typeof(parsed) == TYPE_ARRAY:
-			return parsed
-	return []
-
-
-func _payload_int(result: Dictionary, key: String) -> int:
-	if result.ok and not String(result.payload).is_empty():
-		var parsed = JSON.parse_string(result.payload)
-		if typeof(parsed) == TYPE_DICTIONARY:
-			return int(parsed.get(key, 0))
+func _data_int(result: Dictionary, key: String) -> int:
+	if typeof(result.data) == TYPE_DICTIONARY:
+		return int(result.data.get(key, 0))
 	return 0
 
 
@@ -383,13 +362,13 @@ func _await_request(rid: int) -> Dictionary:
 
 
 func _on_request_completed(request_id: int, _kind: int, ok: bool,
-		payload: String, error: String) -> void:
-	_results[request_id] = { "ok": ok, "payload": payload, "error": error }
+		data, error: String) -> void:
+	_results[request_id] = { "ok": ok, "data": data, "error": error }
 
 
 func _on_sdk_event(sequence_id: int, timestamp_ms: int, kind: String,
-		event_json: String) -> void:
-	sdk_event.emit(sequence_id, timestamp_ms, kind, event_json)
+		event: Dictionary) -> void:
+	sdk_event.emit(sequence_id, timestamp_ms, kind, event)
 
 
 func _on_connection_state_changed(from_state: String, to_state: String) -> void:
@@ -399,6 +378,6 @@ func _on_connection_state_changed(from_state: String, to_state: String) -> void:
 func _on_message_sent(request_id: int, ok: bool, message_id: int, error: String) -> void:
 	# SendText 结果以本信号为准（native 先发 request_completed 再发本信号，
 	# 这里覆盖补齐 message_id，否则 send_text 的 await 永远拿不到结果）。
-	_results[request_id] = { "ok": ok, "payload": "", "error": error,
+	_results[request_id] = { "ok": ok, "data": null, "error": error,
 			"message_id": message_id }
 	message_sent.emit(request_id, ok, message_id, error)
