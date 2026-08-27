@@ -21,14 +21,20 @@ signal send_status_changed(message_id: int, status: int, server_message_id: int)
 signal room_message(payload_text: String, publisher: String, server_message_id: int)
 ## 当前会话未读数变化(收到新消息 / mark_read 之后)。
 signal unread_changed(channel_id: int, count: int)
+## 重连后自动重订阅 Room 的结果;失败(如 ticket 过期)由业务重新签票再 join。
+signal room_rejoined(ok: bool, error: String)
 
 const ROOM_CHANNEL_TYPE := 2
+# 去重集合封顶(spec §7.1):超限批量淘汰最旧,超长在线不无界增长。
+const SEEN_CAP := 4096
+const SEEN_EVICT := 1024
 
 var client: PrivchatClient = null
 var channel_id: int = 0
 var channel_type: int = 1
 var room_channel_id: int = 0
 
+var _room_ticket := ""
 var _seen_room_ids := {}       # server_message_id -> true
 var _seen_timeline := {}       # "channel:message_id" -> true
 
@@ -37,6 +43,8 @@ func setup(p_client: PrivchatClient) -> void:
 	client = p_client
 	if not client.sdk_event.is_connected(_on_sdk_event):
 		client.sdk_event.connect(_on_sdk_event)
+	if not client.connection_state_changed.is_connected(_on_connection_state):
+		client.connection_state_changed.connect(_on_connection_state)
 
 
 # --- 会话生命周期 -----------------------------------------------------------
@@ -86,6 +94,7 @@ func join_room(p_room_channel_id: int, ticket: String) -> Dictionary:
 			p_room_channel_id, ROOM_CHANNEL_TYPE, ticket)
 	if resp.ok:
 		room_channel_id = p_room_channel_id
+		_room_ticket = ticket
 	return resp
 
 
@@ -94,8 +103,18 @@ func leave_room() -> Dictionary:
 		return { "ok": true, "error": "", "data": null }
 	var resp: Dictionary = await client.unsubscribe_channel(room_channel_id, ROOM_CHANNEL_TYPE)
 	room_channel_id = 0
+	_room_ticket = ""
 	_seen_room_ids.clear()
 	return resp
+
+
+## 重连完成(→ Authenticated)后自动重订阅已加入的 Room(spec §7.1)。
+func _on_connection_state(_from_state: String, to_state: String) -> void:
+	if to_state != "Authenticated" or room_channel_id == 0:
+		return
+	var resp: Dictionary = await client.subscribe_channel(
+			room_channel_id, ROOM_CHANNEL_TYPE, _room_ticket)
+	room_rejoined.emit(resp.ok, str(resp.get("error", "")))
 
 
 # --- 事件分发 ---------------------------------------------------------------
@@ -123,7 +142,7 @@ func _handle_timeline(event: Dictionary) -> void:
 	var key := "%d:%d" % [channel_id, message_id]
 	if _seen_timeline.has(key):
 		return
-	_seen_timeline[key] = true
+	_remember(_seen_timeline, key)
 	var resp: Dictionary = await client.get_message_by_id(message_id)
 	if resp.ok and typeof(resp.data) == TYPE_DICTIONARY:
 		message_received.emit(resp.data)
@@ -151,12 +170,21 @@ func _handle_room_broadcast(event: Dictionary) -> void:
 	if server_message_id != 0 and _seen_room_ids.has(server_message_id):
 		return
 	if server_message_id != 0:
-		_seen_room_ids[server_message_id] = true
+		_remember(_seen_room_ids, server_message_id)
 	var bytes := PackedByteArray()
 	for b in body.get("payload", []):
 		bytes.append(int(b))
 	room_message.emit(bytes.get_string_from_utf8(),
 			str(body.get("publisher", "")), server_message_id)
+
+
+## 记入去重集合,超限批量淘汰最旧(Godot Dictionary 保持插入序)。
+func _remember(seen: Dictionary, key) -> void:
+	seen[key] = true
+	if seen.size() > SEEN_CAP:
+		var keys := seen.keys()
+		for i in range(SEEN_EVICT):
+			seen.erase(keys[i])
 
 
 ## 外部标签枚举:{"event":{"Kind":{...}}};unit 变体是 {"event":"Kind"}。

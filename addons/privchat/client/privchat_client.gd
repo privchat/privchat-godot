@@ -14,6 +14,10 @@ extends Node
 signal sdk_event(sequence_id: int, timestamp_ms: int, kind: String, event: Dictionary)
 signal connection_state_changed(from_state: String, to_state: String)
 signal message_sent(request_id: int, ok: bool, message_id: int, error: String)
+## 登录态不可自愈(ForcedLogout):宿主须清理登录态并回登录页。
+signal session_expired(code: int, message: String, source: String)
+## access token 需业务层刷新(AccessTokenRefreshNeeded):刷新后重新 authenticate。
+signal token_refresh_needed(code: int, message: String)
 
 # TaskKind ordinals — must match PrivchatNativeClient::TaskKind.
 const KIND_AUTHENTICATE := 0
@@ -151,36 +155,36 @@ func send_sms_code(mobile: String) -> Dictionary:
 func authenticate(user_id: int, access_token: String, device_id: String,
 		timeout_ms: int = 15000) -> Dictionary:
 	var rid: int = native.authenticate(user_id, access_token, device_id, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 func connect_im(timeout_ms: int = 15000) -> Dictionary:
 	var rid: int = native.connect_async(timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 func disconnect_im(timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.disconnect_async(timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## Bootstrap sync gate：authenticate+connect 后、任何本地优先操作
 ## （发消息等）之前必须完成，对标 TS SDK 的 bootstrapChannels。
 func bootstrap_sync(timeout_ms: int = 30000) -> Dictionary:
 	var rid: int = native.run_bootstrap_sync(timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 func subscribe_channel(channel_id: int, channel_type: int, token: String = "",
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.subscribe_channel(channel_id, channel_type, token, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 func unsubscribe_channel(channel_id: int, channel_type: int,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.unsubscribe_channel(channel_id, channel_type, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## Queue-first text send; resolves when the local message is enqueued.
@@ -189,7 +193,7 @@ func send_text(channel_id: int, channel_type: int, content: String,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.send_text_message(channel_id, channel_type,
 			logged_in_user_id, content, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## Channel Transfer。body 是 Dictionary;返回 { ok, data, error },
@@ -197,24 +201,24 @@ func send_text(channel_id: int, channel_type: int, content: String,
 func transfer(channel_id: int, route: String, body: Dictionary,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.transfer(channel_id, route, body, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## 全局 RPC。body 是 Dictionary;返回 { ok, data, error },data 为服务端响应对象。
 func rpc_call(route: String, body: Dictionary, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.rpc_call(route, body, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 func sync_channel(channel_id: int, channel_type: int, timeout_ms: int = 15000) -> Dictionary:
 	var rid: int = native.sync_channel(channel_id, channel_type, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## 返回 { ok, data: StoredMessage Dictionary | null, error }。
 func get_message_by_id(message_id: int, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_message_by_id(message_id, timeout_ms)
-	return await _await_request(rid)
+	return await _await_request(rid, timeout_ms)
 
 
 ## Direct-channel helper mirroring privchat-sdk-ffi
@@ -246,7 +250,7 @@ func get_or_create_direct_channel(peer_user_id: int) -> Dictionary:
 func open_conversation(channel_id: int, channel_type: int, limit: int = 50,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.open_conversation(channel_id, channel_type, limit, timeout_ms)
-	return _page_view(await _await_request(rid))
+	return _page_view(await _await_request(rid, timeout_ms))
 
 
 ## 上滑加载更早历史(SDK-HISTORY-5);has_more_before=false 即到顶(跨会话持久化)。
@@ -255,14 +259,14 @@ func load_older_history(channel_id: int, channel_type: int,
 		timeout_ms: int = 10000) -> Dictionary:
 	var rid: int = native.load_older_history(channel_id, channel_type,
 			before_server_message_id, limit, timeout_ms)
-	return _page_view(await _await_request(rid))
+	return _page_view(await _await_request(rid, timeout_ms))
 
 
 ## 纯本地分页读(不触网)。返回 { ok, error, messages: Array }。
 func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 		offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.list_messages(channel_id, channel_type, limit, offset, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.messages = result.data if typeof(result.data) == TYPE_ARRAY else []
 	return result
 
@@ -271,7 +275,7 @@ func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 ## 返回 { ok, error, channels: Array }(已按 top 优先、last_msg_timestamp 降序排序)。
 func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.list_channels(limit, offset, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
 	var channels: Array = result.data if typeof(result.data) == TYPE_ARRAY else []
 	channels.sort_custom(func(a, b):
 		if int(a.get("top", 0)) != int(b.get("top", 0)):
@@ -285,7 +289,7 @@ func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> 
 func mark_read_to_pts(channel_id: int, read_pts: int,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.mark_read_to_pts(channel_id, read_pts, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.last_read_pts = _data_int(result, "last_read_pts")
 	return result
 
@@ -294,7 +298,7 @@ func mark_read_to_pts(channel_id: int, read_pts: int,
 func get_channel_unread_count(channel_id: int, channel_type: int,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_channel_unread_count(channel_id, channel_type, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.count = _data_int(result, "count")
 	return result
 
@@ -303,7 +307,7 @@ func get_channel_unread_count(channel_id: int, channel_type: int,
 func get_total_unread_count(exclude_muted: bool = false,
 		timeout_ms: int = 8000) -> Dictionary:
 	var rid: int = native.get_total_unread_count(exclude_muted, timeout_ms)
-	var result: Dictionary = await _await_request(rid)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.count = _data_int(result, "count")
 	return result
 
@@ -353,8 +357,13 @@ func _data_int(result: Dictionary, key: String) -> int:
 	return 0
 
 
-func _await_request(rid: int) -> Dictionary:
+## 每次 await 带硬超时护栏(timeout_ms + 5s 宽限):native 永不应答时
+## 返回失败而不是永久挂起。
+func _await_request(rid: int, timeout_ms: int = 30000) -> Dictionary:
+	var deadline := Time.get_ticks_msec() + timeout_ms + 5000
 	while not _results.has(rid):
+		if Time.get_ticks_msec() > deadline:
+			return { "ok": false, "data": null, "error": "request timeout (rid=%d)" % rid }
 		await get_tree().process_frame
 	var result: Dictionary = _results[rid]
 	_results.erase(rid)
@@ -368,6 +377,16 @@ func _on_request_completed(request_id: int, _kind: int, ok: bool,
 
 func _on_sdk_event(sequence_id: int, timestamp_ms: int, kind: String,
 		event: Dictionary) -> void:
+	# 生命周期事件升级为强类型信号(spec GODOT_SDK_SPEC §7.1)。
+	match kind:
+		"ForcedLogout":
+			var body: Dictionary = event.get("event", {}).get("ForcedLogout", {})
+			session_expired.emit(int(body.get("code", 0)),
+					str(body.get("message", "")), str(body.get("source", "")))
+		"AccessTokenRefreshNeeded":
+			var body: Dictionary = event.get("event", {}).get("AccessTokenRefreshNeeded", {})
+			token_refresh_needed.emit(int(body.get("code", 0)),
+					str(body.get("message", "")))
 	sdk_event.emit(sequence_id, timestamp_ms, kind, event)
 
 

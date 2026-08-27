@@ -98,13 +98,14 @@ bool PrivchatNativeClient::is_initialized() const {
 // ---------------------------------------------------------------------------
 
 uint64_t PrivchatNativeClient::enqueue_task(Task task) {
-    task.request_id = next_request_id.fetch_add(1);
+    const uint64_t rid = next_request_id.fetch_add(1);
+    task.request_id = rid;
     {
         std::lock_guard<std::mutex> lock(queue_mutex);
         task_queue.push_back(std::move(task));
     }
     queue_cv.notify_one();
-    return task.request_id;
+    return rid;
 }
 
 void PrivchatNativeClient::worker_loop() {

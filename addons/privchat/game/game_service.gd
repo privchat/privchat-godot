@@ -17,12 +17,18 @@ extends Node
 ## 上层自行 JSON.parse_string);raw payload 字节在 payload_bytes。
 signal game_event(payload_text: String, payload_bytes: PackedByteArray,
 		publisher: String, server_message_id: int, timestamp: int)
+## 重连后自动重订阅游戏频道的结果;失败(如 ticket 过期)由业务重新签票再 join。
+signal rejoined(ok: bool, error: String)
 
 const ROOM_CHANNEL_TYPE := 2
+# 去重集合封顶(spec §7.1)。
+const SEEN_CAP := 4096
+const SEEN_EVICT := 1024
 
 var client: PrivchatClient = null
 var game_channel_id: int = 0
 
+var _ticket := ""
 var _next_request_id: int = 1
 var _seen_event_ids := {}      # server_message_id -> true
 
@@ -31,6 +37,8 @@ func setup(p_client: PrivchatClient) -> void:
 	client = p_client
 	if not client.sdk_event.is_connected(_on_sdk_event):
 		client.sdk_event.connect(_on_sdk_event)
+	if not client.connection_state_changed.is_connected(_on_connection_state):
+		client.connection_state_changed.connect(_on_connection_state)
 
 
 # --- 频道生命周期 -----------------------------------------------------------
@@ -40,6 +48,7 @@ func join(channel_id: int, ticket: String) -> Dictionary:
 			channel_id, ROOM_CHANNEL_TYPE, ticket)
 	if resp.ok:
 		game_channel_id = channel_id
+		_ticket = ticket
 	return resp
 
 
@@ -49,8 +58,18 @@ func leave() -> Dictionary:
 	var resp: Dictionary = await client.unsubscribe_channel(
 			game_channel_id, ROOM_CHANNEL_TYPE)
 	game_channel_id = 0
+	_ticket = ""
 	_seen_event_ids.clear()
 	return resp
+
+
+## 重连完成(→ Authenticated)后自动重订阅游戏频道(spec §7.1)。
+func _on_connection_state(_from_state: String, to_state: String) -> void:
+	if to_state != "Authenticated" or game_channel_id == 0:
+		return
+	var resp: Dictionary = await client.subscribe_channel(
+			game_channel_id, ROOM_CHANNEL_TYPE, _ticket)
+	rejoined.emit(resp.ok, str(resp.get("error", "")))
 
 
 # --- 指令与 RPC -------------------------------------------------------------
@@ -124,6 +143,10 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 		return
 	if server_message_id != 0:
 		_seen_event_ids[server_message_id] = true
+		if _seen_event_ids.size() > SEEN_CAP:
+			var keys := _seen_event_ids.keys()
+			for i in range(SEEN_EVICT):
+				_seen_event_ids.erase(keys[i])
 	var bytes := PackedByteArray()
 	for b in body.get("payload", []):
 		bytes.append(int(b))
