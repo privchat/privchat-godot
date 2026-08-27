@@ -286,6 +286,104 @@ void PrivchatNativeClient::run_task(const Task &task) {
                 r.error = last_error_or("run_bootstrap_sync failed");
             }
         } break;
+
+        case TaskKind::OpenConversation: {
+            // Slots: u64_a=channel_id, i64_a=channel_type, u64_c=limit.
+            char *out = privchat_capi_open_conversation(c, task.u64_a,
+                    static_cast<int32_t>(task.i64_a),
+                    static_cast<uint32_t>(task.u64_c), timeout_ms);
+            if (out != nullptr) {
+                r.ok = true;
+                r.payload = out;
+                privchat_capi_free_string(out);
+            } else {
+                r.ok = false;
+                r.error = last_error_or("open_conversation failed");
+            }
+        } break;
+
+        case TaskKind::LoadOlderHistory: {
+            // Slots: u64_a=channel_id, i64_a=channel_type,
+            // u64_c=before_server_message_id, u64_d=limit.
+            char *out = privchat_capi_load_older_history(c, task.u64_a,
+                    static_cast<int32_t>(task.i64_a), task.u64_c,
+                    static_cast<uint32_t>(task.u64_d), timeout_ms);
+            if (out != nullptr) {
+                r.ok = true;
+                r.payload = out;
+                privchat_capi_free_string(out);
+            } else {
+                r.ok = false;
+                r.error = last_error_or("load_older_history failed");
+            }
+        } break;
+
+        case TaskKind::ListMessages: {
+            // Slots: u64_a=channel_id, i64_a=channel_type, u64_c=limit, u64_d=offset.
+            char *out = privchat_capi_list_messages(c, task.u64_a,
+                    static_cast<int32_t>(task.i64_a), task.u64_c, task.u64_d,
+                    timeout_ms);
+            if (out != nullptr) {
+                r.ok = true;
+                r.payload = out;
+                privchat_capi_free_string(out);
+            } else {
+                r.ok = false;
+                r.error = last_error_or("list_messages failed");
+            }
+        } break;
+
+        case TaskKind::ListChannels: {
+            // Slots: u64_c=limit, u64_d=offset.
+            char *out = privchat_capi_list_channels(c, task.u64_c, task.u64_d, timeout_ms);
+            if (out != nullptr) {
+                r.ok = true;
+                r.payload = out;
+                privchat_capi_free_string(out);
+            } else {
+                r.ok = false;
+                r.error = last_error_or("list_channels failed");
+            }
+        } break;
+
+        case TaskKind::MarkReadToPts: {
+            // Slots: u64_a=channel_id, u64_c=read_pts.
+            uint64_t last_read_pts = 0;
+            r.code = privchat_capi_mark_read_to_pts(c, task.u64_a, task.u64_c,
+                    timeout_ms, &last_read_pts);
+            r.ok = r.code == PRIVCHAT_CAPI_OK;
+            if (r.ok) {
+                r.payload = "{\"last_read_pts\":" + std::to_string(last_read_pts) + "}";
+            } else {
+                r.error = last_error_or("mark_read_to_pts failed");
+            }
+        } break;
+
+        case TaskKind::ChannelUnread: {
+            // Slots: u64_a=channel_id, i64_a=channel_type.
+            int32_t count = 0;
+            r.code = privchat_capi_get_channel_unread_count(c, task.u64_a,
+                    static_cast<int32_t>(task.i64_a), timeout_ms, &count);
+            r.ok = r.code == PRIVCHAT_CAPI_OK;
+            if (r.ok) {
+                r.payload = "{\"count\":" + std::to_string(count) + "}";
+            } else {
+                r.error = last_error_or("get_channel_unread_count failed");
+            }
+        } break;
+
+        case TaskKind::TotalUnread: {
+            // Slots: i64_a=exclude_muted (0/1).
+            int32_t count = 0;
+            r.code = privchat_capi_get_total_unread_count(c,
+                    static_cast<int32_t>(task.i64_a), timeout_ms, &count);
+            r.ok = r.code == PRIVCHAT_CAPI_OK;
+            if (r.ok) {
+                r.payload = "{\"count\":" + std::to_string(count) + "}";
+            } else {
+                r.error = last_error_or("get_total_unread_count failed");
+            }
+        } break;
     }
     push_result(std::move(r));
 }
@@ -486,6 +584,78 @@ uint64_t PrivchatNativeClient::get_message_by_id(uint64_t message_id, int64_t ti
     return enqueue_task(std::move(t));
 }
 
+uint64_t PrivchatNativeClient::open_conversation(uint64_t channel_id, int64_t channel_type,
+        int64_t limit, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::OpenConversation;
+    t.u64_a = channel_id;
+    t.i64_a = channel_type;
+    t.u64_c = (uint64_t)limit;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::load_older_history(uint64_t channel_id, int64_t channel_type,
+        uint64_t before_server_message_id, int64_t limit, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::LoadOlderHistory;
+    t.u64_a = channel_id;
+    t.i64_a = channel_type;
+    t.u64_c = before_server_message_id;
+    t.u64_d = (uint64_t)limit;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::list_messages(uint64_t channel_id, int64_t channel_type,
+        int64_t limit, int64_t offset, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::ListMessages;
+    t.u64_a = channel_id;
+    t.i64_a = channel_type;
+    t.u64_c = (uint64_t)limit;
+    t.u64_d = (uint64_t)offset;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::list_channels(int64_t limit, int64_t offset, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::ListChannels;
+    t.u64_c = (uint64_t)limit;
+    t.u64_d = (uint64_t)offset;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::mark_read_to_pts(uint64_t channel_id, uint64_t read_pts,
+        int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::MarkReadToPts;
+    t.u64_a = channel_id;
+    t.u64_c = read_pts;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::get_channel_unread_count(uint64_t channel_id,
+        int64_t channel_type, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::ChannelUnread;
+    t.u64_a = channel_id;
+    t.i64_a = channel_type;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::get_total_unread_count(bool exclude_muted, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::TotalUnread;
+    t.i64_a = exclude_muted ? 1 : 0;
+    t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
 // ---------------------------------------------------------------------------
 // Sync getters (short blocking calls)
 // ---------------------------------------------------------------------------
@@ -577,6 +747,21 @@ void PrivchatNativeClient::_bind_methods() {
             &PrivchatNativeClient::sync_channel, DEFVAL((int64_t)15000));
     ClassDB::bind_method(D_METHOD("get_message_by_id", "message_id", "timeout_ms"),
             &PrivchatNativeClient::get_message_by_id, DEFVAL((int64_t)8000));
+
+    ClassDB::bind_method(D_METHOD("open_conversation", "channel_id", "channel_type", "limit", "timeout_ms"),
+            &PrivchatNativeClient::open_conversation, DEFVAL((int64_t)50), DEFVAL((int64_t)10000));
+    ClassDB::bind_method(D_METHOD("load_older_history", "channel_id", "channel_type", "before_server_message_id", "limit", "timeout_ms"),
+            &PrivchatNativeClient::load_older_history, DEFVAL((int64_t)50), DEFVAL((int64_t)10000));
+    ClassDB::bind_method(D_METHOD("list_messages", "channel_id", "channel_type", "limit", "offset", "timeout_ms"),
+            &PrivchatNativeClient::list_messages, DEFVAL((int64_t)50), DEFVAL((int64_t)0), DEFVAL((int64_t)8000));
+    ClassDB::bind_method(D_METHOD("list_channels", "limit", "offset", "timeout_ms"),
+            &PrivchatNativeClient::list_channels, DEFVAL((int64_t)50), DEFVAL((int64_t)0), DEFVAL((int64_t)8000));
+    ClassDB::bind_method(D_METHOD("mark_read_to_pts", "channel_id", "read_pts", "timeout_ms"),
+            &PrivchatNativeClient::mark_read_to_pts, DEFVAL((int64_t)8000));
+    ClassDB::bind_method(D_METHOD("get_channel_unread_count", "channel_id", "channel_type", "timeout_ms"),
+            &PrivchatNativeClient::get_channel_unread_count, DEFVAL((int64_t)8000));
+    ClassDB::bind_method(D_METHOD("get_total_unread_count", "exclude_muted", "timeout_ms"),
+            &PrivchatNativeClient::get_total_unread_count, DEFVAL(false), DEFVAL((int64_t)8000));
 
     ClassDB::bind_method(D_METHOD("connection_state_sync", "timeout_ms"),
             &PrivchatNativeClient::connection_state_sync, DEFVAL((int64_t)2000));

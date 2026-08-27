@@ -39,6 +39,14 @@ public:
         SyncChannel,
         GetMessageById,
         BootstrapSync,
+        // Conversation history / channel list / read state (local-first).
+        OpenConversation,
+        LoadOlderHistory,
+        ListMessages,
+        ListChannels,
+        MarkReadToPts,
+        ChannelUnread,
+        TotalUnread,
     };
 
     struct Task {
@@ -47,6 +55,8 @@ public:
         // Argument slots used per-kind (strings/ints kept as plain fields).
         uint64_t u64_a = 0;
         uint64_t u64_b = 0;
+        uint64_t u64_c = 0;
+        uint64_t u64_d = 0;
         int64_t i64_a = 0;
         std::string str_a;
         std::string str_b;
@@ -114,6 +124,16 @@ public:
     uint64_t rpc_call(const String &route, const String &body_json, int64_t timeout_ms);
     uint64_t sync_channel(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
     uint64_t get_message_by_id(uint64_t message_id, int64_t timeout_ms);
+
+    // Conversation history / channel list / read state (local-first mirrors
+    // of the c-api; results arrive as JSON payloads via request_completed).
+    uint64_t open_conversation(uint64_t channel_id, int64_t channel_type, int64_t limit, int64_t timeout_ms);
+    uint64_t load_older_history(uint64_t channel_id, int64_t channel_type, uint64_t before_server_message_id, int64_t limit, int64_t timeout_ms);
+    uint64_t list_messages(uint64_t channel_id, int64_t channel_type, int64_t limit, int64_t offset, int64_t timeout_ms);
+    uint64_t list_channels(int64_t limit, int64_t offset, int64_t timeout_ms);
+    uint64_t mark_read_to_pts(uint64_t channel_id, uint64_t read_pts, int64_t timeout_ms);
+    uint64_t get_channel_unread_count(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
+    uint64_t get_total_unread_count(bool exclude_muted, int64_t timeout_ms);
 
     // --- sync getters (short blocking calls, main-thread safe) ---------
     String connection_state_sync(int64_t timeout_ms);

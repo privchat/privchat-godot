@@ -24,6 +24,13 @@ const KIND_RPC_CALL := 8
 const KIND_SYNC_CHANNEL := 9
 const KIND_GET_MESSAGE_BY_ID := 10
 const KIND_BOOTSTRAP_SYNC := 11
+const KIND_OPEN_CONVERSATION := 12
+const KIND_LOAD_OLDER_HISTORY := 13
+const KIND_LIST_MESSAGES := 14
+const KIND_LIST_CHANNELS := 15
+const KIND_MARK_READ_TO_PTS := 16
+const KIND_CHANNEL_UNREAD := 17
+const KIND_TOTAL_UNREAD := 18
 
 ## IM server endpoint. Local dev default matches privchat-sdk's own default.
 var server_host: String = "127.0.0.1"
@@ -229,6 +236,77 @@ func get_or_create_direct_channel(peer_user_id: int) -> Dictionary:
 	return { "ok": true, "payload": resp.payload, "error": "", "channel_id": channel_id }
 
 
+# ---------------------------------------------------------------------------
+# conversation history / channel list / read state (local-first)
+# ---------------------------------------------------------------------------
+
+## 打开会话(SDK-HISTORY-7):本地为渲染真源,本地为空补一次最新窗口。
+## 返回 { ok, error, messages: Array, has_more_before: bool, fetched_from_server: bool }。
+func open_conversation(channel_id: int, channel_type: int, limit: int = 50,
+		timeout_ms: int = 10000) -> Dictionary:
+	var rid: int = native.open_conversation(channel_id, channel_type, limit, timeout_ms)
+	return _parse_page(await _await_request(rid))
+
+
+## 上滑加载更早历史(SDK-HISTORY-5);has_more_before=false 即到顶(跨会话持久化)。
+func load_older_history(channel_id: int, channel_type: int,
+		before_server_message_id: int, limit: int = 50,
+		timeout_ms: int = 10000) -> Dictionary:
+	var rid: int = native.load_older_history(channel_id, channel_type,
+			before_server_message_id, limit, timeout_ms)
+	return _parse_page(await _await_request(rid))
+
+
+## 纯本地分页读(不触网)。返回 { ok, error, messages: Array }。
+func list_messages(channel_id: int, channel_type: int, limit: int = 50,
+		offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.list_messages(channel_id, channel_type, limit, offset, timeout_ms)
+	var result: Dictionary = await _await_request(rid)
+	result.messages = _parse_json_array(result)
+	return result
+
+
+## 本地会话列表;条目自带 unread_count/top/mute/last_msg_timestamp/last_msg_content。
+## 返回 { ok, error, channels: Array }(已按 top 优先、last_msg_timestamp 降序排序)。
+func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.list_channels(limit, offset, timeout_ms)
+	var result: Dictionary = await _await_request(rid)
+	var channels := _parse_json_array(result)
+	channels.sort_custom(func(a, b):
+		if int(a.get("top", 0)) != int(b.get("top", 0)):
+			return int(a.get("top", 0)) > int(b.get("top", 0))
+		return int(a.get("last_msg_timestamp", 0)) > int(b.get("last_msg_timestamp", 0)))
+	result.channels = channels
+	return result
+
+
+## 已读游标推进:RPC 上报 + 本地投影。返回 { ok, error, last_read_pts: int }。
+func mark_read_to_pts(channel_id: int, read_pts: int,
+		timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.mark_read_to_pts(channel_id, read_pts, timeout_ms)
+	var result: Dictionary = await _await_request(rid)
+	result.last_read_pts = _payload_int(result, "last_read_pts")
+	return result
+
+
+## 单频道未读数(本地)。返回 { ok, error, count: int }。
+func get_channel_unread_count(channel_id: int, channel_type: int,
+		timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.get_channel_unread_count(channel_id, channel_type, timeout_ms)
+	var result: Dictionary = await _await_request(rid)
+	result.count = _payload_int(result, "count")
+	return result
+
+
+## 全局未读角标(本地)。返回 { ok, error, count: int }。
+func get_total_unread_count(exclude_muted: bool = false,
+		timeout_ms: int = 8000) -> Dictionary:
+	var rid: int = native.get_total_unread_count(exclude_muted, timeout_ms)
+	var result: Dictionary = await _await_request(rid)
+	result.count = _payload_int(result, "count")
+	return result
+
+
 # --- sync getters -----------------------------------------------------------
 
 func connection_state(timeout_ms: int = 2000) -> String:
@@ -264,6 +342,36 @@ func _ensure_started() -> bool:
 	if native != null:
 		return true
 	return start()
+
+
+## 解析 { messages, has_more_before, ... } 形状的分页 payload。
+func _parse_page(result: Dictionary) -> Dictionary:
+	result.messages = []
+	result.has_more_before = false
+	result.fetched_from_server = false
+	if result.ok and not String(result.payload).is_empty():
+		var parsed = JSON.parse_string(result.payload)
+		if typeof(parsed) == TYPE_DICTIONARY:
+			result.messages = parsed.get("messages", [])
+			result.has_more_before = bool(parsed.get("has_more_before", false))
+			result.fetched_from_server = bool(parsed.get("fetched_from_server", false))
+	return result
+
+
+func _parse_json_array(result: Dictionary) -> Array:
+	if result.ok and not String(result.payload).is_empty():
+		var parsed = JSON.parse_string(result.payload)
+		if typeof(parsed) == TYPE_ARRAY:
+			return parsed
+	return []
+
+
+func _payload_int(result: Dictionary, key: String) -> int:
+	if result.ok and not String(result.payload).is_empty():
+		var parsed = JSON.parse_string(result.payload)
+		if typeof(parsed) == TYPE_DICTIONARY:
+			return int(parsed.get(key, 0))
+	return 0
 
 
 func _await_request(rid: int) -> Dictionary:

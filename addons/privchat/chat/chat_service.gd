@@ -1,0 +1,171 @@
+# chat_service.gd — 面向 UI 的会话服务(单会话上下文 + Room 世界频道)。
+#
+# 职责:把 PrivchatClient 的低层 awaitable + sdk_event 流,收敛成一个
+# 频道视角的聊天 API:打开会话(local-first 历史)、上滑翻页、发送、已读、
+# 未读数、会话列表;事件按当前频道过滤后以强类型信号发出。
+#
+# 用法:
+#   var chat := PrivchatChatService.new()
+#   add_child(chat)
+#   chat.setup(client)
+#   var page := await chat.open(channel_id, 1)
+#   chat.message_received.connect(_on_message)
+class_name PrivchatChatService
+extends Node
+
+## 当前会话收到新消息(已从本地时间线取到完整 StoredMessage)。
+signal message_received(message: Dictionary)
+## 当前会话内本端消息投递状态变化(status: 0=queued/1=sent/2=delivered...)。
+signal send_status_changed(message_id: int, status: int, server_message_id: int)
+## Room 广播(已按 server_message_id 去重)。
+signal room_message(payload_text: String, publisher: String, server_message_id: int)
+## 当前会话未读数变化(收到新消息 / mark_read 之后)。
+signal unread_changed(channel_id: int, count: int)
+
+const ROOM_CHANNEL_TYPE := 2
+
+var client: PrivchatClient = null
+var channel_id: int = 0
+var channel_type: int = 1
+var room_channel_id: int = 0
+
+var _seen_room_ids := {}       # server_message_id -> true
+var _seen_timeline := {}       # "channel:message_id" -> true
+
+
+func setup(p_client: PrivchatClient) -> void:
+	client = p_client
+	if not client.sdk_event.is_connected(_on_sdk_event):
+		client.sdk_event.connect(_on_sdk_event)
+
+
+# --- 会话生命周期 -----------------------------------------------------------
+
+## 打开会话:本地为渲染真源,本地为空时 SDK 补一次最新窗口(SDK-HISTORY-7)。
+## 返回 { ok, error, messages, has_more_before, fetched_from_server }。
+func open(p_channel_id: int, p_channel_type: int, limit: int = 50) -> Dictionary:
+	channel_id = p_channel_id
+	channel_type = p_channel_type
+	return await client.open_conversation(channel_id, channel_type, limit)
+
+
+## 上滑加载更早历史;has_more_before=false 即到顶(SDK 持久化水位)。
+func load_older(before_server_message_id: int, limit: int = 50) -> Dictionary:
+	return await client.load_older_history(channel_id, channel_type,
+			before_server_message_id, limit)
+
+
+## queue-first 发送;投递进度经 send_status_changed 信号到达。
+func send_text(content: String) -> Dictionary:
+	return await client.send_text(channel_id, channel_type, content)
+
+
+## 已读推进到 read_pts;成功后刷新并广播未读数。
+func mark_read(read_pts: int) -> Dictionary:
+	var resp: Dictionary = await client.mark_read_to_pts(channel_id, read_pts)
+	if resp.ok:
+		var unread: Dictionary = await client.get_channel_unread_count(channel_id, channel_type)
+		if unread.ok:
+			unread_changed.emit(channel_id, unread.count)
+	return resp
+
+
+func unread_count() -> Dictionary:
+	return await client.get_channel_unread_count(channel_id, channel_type)
+
+
+## 会话列表(已按 top 优先、last_msg_timestamp 降序排序;条目带 unread_count)。
+func channel_list(limit: int = 50, offset: int = 0) -> Dictionary:
+	return await client.list_channels(limit, offset)
+
+
+# --- Room 世界频道 ----------------------------------------------------------
+
+func join_room(p_room_channel_id: int, ticket: String) -> Dictionary:
+	var resp: Dictionary = await client.subscribe_channel(
+			p_room_channel_id, ROOM_CHANNEL_TYPE, ticket)
+	if resp.ok:
+		room_channel_id = p_room_channel_id
+	return resp
+
+
+func leave_room() -> Dictionary:
+	if room_channel_id == 0:
+		return { "ok": true, "error": "", "payload": "" }
+	var resp: Dictionary = await client.unsubscribe_channel(room_channel_id, ROOM_CHANNEL_TYPE)
+	room_channel_id = 0
+	_seen_room_ids.clear()
+	return resp
+
+
+# --- 事件分发 ---------------------------------------------------------------
+
+func _on_sdk_event(_seq: int, _ts: int, kind: String, event_json: String) -> void:
+	match kind:
+		"TimelineUpdated":
+			_handle_timeline(event_json)
+		"MessageSendStatusChanged":
+			_handle_send_status(event_json)
+		"SubscriptionMessageReceived":
+			_handle_room_broadcast(event_json)
+
+
+func _handle_timeline(event_json: String) -> void:
+	var body := _event_body(event_json, "TimelineUpdated")
+	if int(body.get("channel_id", -1)) != channel_id:
+		return
+	# 只把「新消息落库」转成 message_received;sync/回执等 reason 不重复弹消息。
+	if str(body.get("reason", "")) != "realtime_message":
+		return
+	var message_id: int = int(body.get("message_id", 0))
+	if message_id <= 0:
+		return
+	var key := "%d:%d" % [channel_id, message_id]
+	if _seen_timeline.has(key):
+		return
+	_seen_timeline[key] = true
+	var resp: Dictionary = await client.get_message_by_id(message_id)
+	if resp.ok and resp.has("data"):
+		message_received.emit(resp.data)
+	var unread: Dictionary = await client.get_channel_unread_count(channel_id, channel_type)
+	if unread.ok:
+		unread_changed.emit(channel_id, unread.count)
+
+
+func _handle_send_status(event_json: String) -> void:
+	var body := _event_body(event_json, "MessageSendStatusChanged")
+	if body.is_empty():
+		return
+	send_status_changed.emit(int(body.get("message_id", 0)),
+			int(body.get("status", 0)),
+			int(body.get("server_message_id", 0) if body.get("server_message_id") != null else 0))
+
+
+func _handle_room_broadcast(event_json: String) -> void:
+	var body := _event_body(event_json, "SubscriptionMessageReceived")
+	if int(body.get("channel_id", -1)) != room_channel_id:
+		return
+	var server_message_id: int = int(body.get("server_message_id", 0) \
+			if body.get("server_message_id") != null else 0)
+	# 重连重放防抖:同一 server_message_id 只发一次。
+	if server_message_id != 0 and _seen_room_ids.has(server_message_id):
+		return
+	if server_message_id != 0:
+		_seen_room_ids[server_message_id] = true
+	var bytes := PackedByteArray()
+	for b in body.get("payload", []):
+		bytes.append(int(b))
+	room_message.emit(bytes.get_string_from_utf8(),
+			str(body.get("publisher", "")), server_message_id)
+
+
+## 外部标签枚举:{"event":{"Kind":{...}}};unit 变体是 {"event":"Kind"}。
+func _event_body(event_json: String, kind: String) -> Dictionary:
+	var parsed = JSON.parse_string(event_json)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return {}
+	var ev = parsed.get("event", {})
+	if typeof(ev) != TYPE_DICTIONARY:
+		return {}
+	var body = ev.get(kind, {})
+	return body if typeof(body) == TYPE_DICTIONARY else {}
