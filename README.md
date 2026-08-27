@@ -4,6 +4,9 @@ Godot 4.x addon wrapping the PrivChat SDK via a stable C ABI: a GDExtension
 (C++ over godot-cpp) hosting the Rust `privchat-sdk-c-api`, plus a GDScript
 facade (`addons/privchat`) for game code.
 
+Canonical spec (SSOT): `privchat-docs/spec/04-client/GODOT_SDK_SPEC.md`.
+`docs/` in this repo holds process documents only.
+
 ## Layout
 
 - `addons/privchat/` — the shipped addon: GDScript facade + `bin/` dylibs +

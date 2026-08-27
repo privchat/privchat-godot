@@ -1,5 +1,8 @@
 # chat/ + game/ Facade 里程碑设计
 
+> ⚠️ 过程文档(里程碑设计快照,已实施完毕)。常青权威 spec 见
+> `privchat-docs/spec/04-client/GODOT_SDK_SPEC.md`(SSOT);两者冲突时以后者为准。
+
 日期:2026-08-27
 状态:已与用户确认方向(通用游戏传输层 + 游戏内聊天;未读数纳入;无搜索/撤回/置顶/附件)
 范围:privchat-sdk(c-api)、privchat-godot、privchat-godot-demo 三仓库
