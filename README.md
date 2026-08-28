@@ -7,6 +7,10 @@ facade (`addons/privchat`) for game code.
 Canonical spec (SSOT): `privchat-docs/spec/04-client/GODOT_SDK_SPEC.md`.
 `docs/` in this repo holds process documents only.
 
+The extension talks to the SDK **only** through the C ABI in
+`privchat-sdk-c-api` (`privchat_sdk_c_api.h`). UniFFI is the binding layer for
+Kotlin/Swift and is not used, included, or linked here.
+
 ## Layout
 
 - `addons/privchat/` — the shipped addon: GDScript facade + `bin/` dylibs +

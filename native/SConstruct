@@ -33,7 +33,8 @@ if not os.path.isfile(os.path.join(SDK_INCLUDE, "privchat_sdk_c_api.h")):
     )
     sys.exit(1)
 
-env.Append(CPPPATH=["#include", "#src", SDK_INCLUDE])
+# 只吃 privchat-sdk-c-api 的 C ABI 头;本扩展不接触 UniFFI 生成物。
+env.Append(CPPPATH=["#src", SDK_INCLUDE])
 
 if env["platform"] == "macos":
     # Godot engine 4.3+ requires C++17.
