@@ -14,6 +14,7 @@
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "privchat_sdk_c_api.h"
 
@@ -40,6 +42,7 @@ public:
         Unsubscribe,
         SendText,
         Transfer,
+        TransferBytes,
         RpcCall,
         SyncChannel,
         GetMessageById,
@@ -66,6 +69,7 @@ public:
         std::string str_a;
         std::string str_b;
         std::string str_c;
+        std::vector<uint8_t> bytes_in;   // TransferBytes: 原始请求体
     };
 
     struct TaskResult {
@@ -76,6 +80,8 @@ public:
         std::string payload; // JSON result when applicable
         std::string error;
         uint64_t message_id = 0; // send_text local message id
+        std::vector<uint8_t> bytes_out; // TransferBytes: 原始应答体
+        int32_t envelope_code = 0;      // TransferBytes: transfer 信封 code
     };
 
 private:
@@ -126,6 +132,9 @@ public:
     uint64_t unsubscribe_channel(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
     uint64_t send_text_message(uint64_t channel_id, int64_t channel_type, uint64_t from_uid, const String &content, int64_t timeout_ms);
     uint64_t transfer(uint64_t channel_id, const String &route, const Dictionary &body, int64_t timeout_ms);
+    // 二进制 Channel Transfer:FlatBuffers/Protobuf 等任意字节,含内嵌 NUL。
+    uint64_t transfer_bytes(uint64_t channel_id, const String &route,
+            const PackedByteArray &body, int64_t timeout_ms);
     uint64_t rpc_call(const String &route, const Dictionary &body, int64_t timeout_ms);
     uint64_t sync_channel(uint64_t channel_id, int64_t channel_type, int64_t timeout_ms);
     uint64_t get_message_by_id(uint64_t message_id, int64_t timeout_ms);

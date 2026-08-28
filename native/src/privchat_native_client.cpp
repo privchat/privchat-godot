@@ -246,6 +246,34 @@ void PrivchatNativeClient::run_task(const Task &task) {
             }
         } break;
 
+        case TaskKind::TransferBytes: {
+            int32_t envelope_code = 0;
+            PrivchatCapiBuffer reply{};
+            const uint8_t *body_ptr = task.bytes_in.empty() ? nullptr : task.bytes_in.data();
+            int32_t rc = privchat_capi_transfer_bytes(c, task.u64_a,
+                    task.str_a.c_str(), body_ptr, task.bytes_in.size(),
+                    task.u64_b, &envelope_code, &reply);
+            TaskResult r;
+            r.request_id = task.request_id;
+            r.kind = task.kind;
+            r.code = rc;
+            r.envelope_code = envelope_code;
+            if (rc == PRIVCHAT_CAPI_OK) {
+                r.ok = envelope_code == 0;
+                if (reply.data != nullptr && reply.len > 0) {
+                    r.bytes_out.assign(reply.data, reply.data + reply.len);
+                }
+                if (!r.ok) {
+                    r.error = last_error_or("transfer error");
+                }
+            } else {
+                r.ok = false;
+                r.error = last_error_or("transfer_bytes failed");
+            }
+            privchat_capi_free_buffer(&reply);
+            push_result(std::move(r));
+            break;
+        }
         case TaskKind::RpcCall: {
             char *out = privchat_capi_rpc_call(c, task.str_a.c_str(), task.str_b.c_str(), timeout_ms);
             if (out != nullptr) {
@@ -404,7 +432,18 @@ void PrivchatNativeClient::drain_results() {
         // Serialization boundary: the JSON payload from the C ABI is parsed
         // exactly once here; GDScript receives a Dictionary/Array/null Variant.
         Variant data;
-        if (!r.payload.empty()) {
+        if (r.kind == TaskKind::TransferBytes) {
+            // 二进制应答:绕开 JSON,原样交给 GDScript。
+            PackedByteArray bytes;
+            bytes.resize((int64_t)r.bytes_out.size());
+            for (size_t i = 0; i < r.bytes_out.size(); i++) {
+                bytes[(int64_t)i] = r.bytes_out[i];
+            }
+            Dictionary d;
+            d["code"] = (int64_t)r.envelope_code;
+            d["data"] = bytes;
+            data = d;
+        } else if (!r.payload.empty()) {
             data = JSON::parse_string(String::utf8(r.payload.c_str()));
         }
         emit_signal("request_completed", (int64_t)r.request_id, (int64_t)r.kind,
@@ -556,6 +595,21 @@ uint64_t PrivchatNativeClient::transfer(uint64_t channel_id, const String &route
     t.str_a = to_std(route);
     t.str_b = to_std(JSON::stringify(body));
     t.u64_b = (uint64_t)timeout_ms;
+    return enqueue_task(std::move(t));
+}
+
+uint64_t PrivchatNativeClient::transfer_bytes(uint64_t channel_id, const String &route,
+        const PackedByteArray &body, int64_t timeout_ms) {
+    Task t;
+    t.kind = TaskKind::TransferBytes;
+    t.u64_a = channel_id;
+    t.str_a = to_std(route);
+    t.u64_b = (uint64_t)timeout_ms;
+    const int64_t n = body.size();
+    t.bytes_in.resize((size_t)n);
+    for (int64_t i = 0; i < n; i++) {
+        t.bytes_in[(size_t)i] = body[i];
+    }
     return enqueue_task(std::move(t));
 }
 
@@ -746,6 +800,8 @@ void PrivchatNativeClient::_bind_methods() {
             &PrivchatNativeClient::send_text_message, DEFVAL((int64_t)10000));
     ClassDB::bind_method(D_METHOD("transfer", "channel_id", "route", "body", "timeout_ms"),
             &PrivchatNativeClient::transfer, DEFVAL((int64_t)8000));
+    ClassDB::bind_method(D_METHOD("transfer_bytes", "channel_id", "route", "body", "timeout_ms"),
+            &PrivchatNativeClient::transfer_bytes, DEFVAL((int64_t)8000));
     ClassDB::bind_method(D_METHOD("rpc_call", "route", "body", "timeout_ms"),
             &PrivchatNativeClient::rpc_call, DEFVAL((int64_t)8000));
     ClassDB::bind_method(D_METHOD("sync_channel", "channel_id", "channel_type", "timeout_ms"),

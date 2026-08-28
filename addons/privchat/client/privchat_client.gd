@@ -34,6 +34,7 @@ const KIND_SUBSCRIBE := 4
 const KIND_UNSUBSCRIBE := 5
 const KIND_SEND_TEXT := 6
 const KIND_TRANSFER := 7
+const KIND_TRANSFER_BYTES := 19
 const KIND_RPC_CALL := 8
 const KIND_SYNC_CHANNEL := 9
 const KIND_GET_MESSAGE_BY_ID := 10
@@ -406,6 +407,27 @@ func transfer(channel_id: int, route: String, body: Dictionary,
 		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.transfer(channel_id, route, body, timeout_ms)
 	return await _await_request(rid, timeout_ms)
+
+
+## 二进制 Channel Transfer:body/返回都是 PackedByteArray,可承载
+## FlatBuffers/Protobuf 等含内嵌 NUL 的负载(字符串版 transfer 做不到)。
+## 返回 { ok, code, data: PackedByteArray, error };ok 表示信封 code == 0。
+func transfer_bytes(channel_id: int, route: String, body: PackedByteArray,
+		timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "code": -1, "data": PackedByteArray(), "error": gate }
+	var rid: int = native.transfer_bytes(channel_id, route, body, timeout_ms)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
+	var envelope: Dictionary = result.data if typeof(result.data) == TYPE_DICTIONARY else {}
+	return {
+		"ok": result.ok,
+		"code": int(envelope.get("code", -1)),
+		"data": envelope.get("data", PackedByteArray()),
+		"error": str(result.get("error", "")),
+	}
 
 
 ## 全局 RPC。body 是 Dictionary;返回 { ok, data, error },data 为服务端响应对象。
