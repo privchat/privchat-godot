@@ -68,14 +68,19 @@ var logged_in_device_id: String = ""
 ## 只交给 token_provider(见下)——契约见 spec TOKEN_REFRESH_SPEC §3。
 var refresh_token_value: String = ""
 
-## Token 来源钩子。签名:func(refresh_token: String, device_id: String) -> Dictionary
-##   返回 { ok, data: { user_id, access_token, refresh_token }, error, terminal: bool }
-## 留空时使用内置的 privchat-application member 模块刷新(模式 B)。
-## 模式 C(业务后台自有 token 体系)由宿主赋值覆盖,addon 不预设业务路由。
+## Token 来源 adapter(可替换)。签名:
+##   func(refresh_token: String, device_id: String) -> Dictionary
+##   返回 { ok, data: { user_id, access_token, refresh_token }, error, terminal }
+## 留空时用默认的 PrivchatApplicationAuthProvider(模式 B,平台 member 模块)。
+## 模式 C(业务后台自有 token 体系)由宿主赋值覆盖 —— core 只做编排,
+## 不把任何一条 refresh 路径写死为核心职责。
 var token_provider: Callable = Callable()
+
+var _default_provider: PrivchatApplicationAuthProvider = null
 
 var _refreshing := false           # single-flight 闸门
 var _auth_generation: int = 0      # 登录代际:旧刷新结果不得覆盖新会话
+var _logout_broadcast := false     # 同一代际内 logout_required 只广播一次
 
 var _results: Dictionary = {}      # request_id -> result Dictionary
 var _abandoned: Dictionary = {}    # request_id -> true(已超时,结果迟到即丢弃)
@@ -194,6 +199,20 @@ func send_sms_code(mobile: String) -> Dictionary:
 # privchat-application member 刷新,模式 C 由宿主覆盖。
 # ---------------------------------------------------------------------------
 
+## 需要服务端的操作在刷新期间统一等待,避免每个调用方各自记得加 gate。
+## 返回非空字符串表示应以该错误直接失败。
+## connect/authenticate 不走本 gate:它们是恢复流程本身,gate 会死锁。
+func _gate_network(timeout_ms: int = 10000) -> String:
+	if not _refreshing:
+		return ""
+	var settled := await await_auth_ready(timeout_ms)
+	if not settled:
+		return "AUTH_REFRESHING"
+	if logged_in_user_id < 0:
+		return "NO_SESSION"
+	return ""
+
+
 ## 是否正在刷新。刷新期间本地读(local-first)照常可用,不做全局阻塞 ——
 ## 阻塞会违反 spec §7.1 的离线可用契约。
 func is_refreshing() -> bool:
@@ -219,6 +238,9 @@ func refresh_now() -> Dictionary:
 		return { "ok": settled and logged_in_user_id >= 0, "error": "", "terminal": false }
 	if native == null:
 		return { "ok": false, "error": "client not started", "terminal": false }
+	# 会话已清理:直接告知调用方,不再广播退出(否则多个界面会重复跳登录页)。
+	if logged_in_user_id < 0 and refresh_token_value.is_empty():
+		return { "ok": false, "error": "NO_SESSION", "terminal": true }
 
 	_refreshing = true
 	var generation := _auth_generation
@@ -232,7 +254,7 @@ func refresh_now() -> Dictionary:
 
 	if result.terminal:
 		_clear_session()
-		logout_required.emit(int(result.get("code", 0)), str(result.error))
+		_broadcast_logout(int(result.get("code", 0)), str(result.error))
 	else:
 		auth_recovered.emit(result.ok, str(result.error))
 	return result
@@ -242,14 +264,8 @@ func _run_refresh(generation: int, device_id: String) -> Dictionary:
 	if refresh_token_value.is_empty() and not token_provider.is_valid():
 		return { "ok": false, "error": "no refresh token and no token_provider", "terminal": true }
 
-	var provided: Dictionary
-	if token_provider.is_valid():
-		provided = await token_provider.call(refresh_token_value, device_id)
-	else:
-		provided = await _ensure_auth().refresh_token(refresh_token_value, device_id)
-		# member 模块拒绝刷新 = refresh token 失效/被撤销 → 终态,不再重试。
-		if not provided.get("ok", false):
-			provided["terminal"] = true
+	var provider := token_provider if token_provider.is_valid() else _ensure_default_provider()
+	var provided: Dictionary = await provider.call(refresh_token_value, device_id)
 
 	if not provided.get("ok", false):
 		return { "ok": false, "error": str(provided.get("error", "refresh failed")),
@@ -276,11 +292,27 @@ func _run_refresh(generation: int, device_id: String) -> Dictionary:
 
 
 ## 清理登录态(终态失败/强制登出)。不触碰 native 连接,由宿主决定去留。
+## refresh_token 在此清除:登出、换账号、代际变化都会走到这里。
+## 默认 provider(模式 B)。core 与它之间只有 Callable 契约,可整体替换。
+func _ensure_default_provider() -> Callable:
+	if _default_provider == null:
+		_default_provider = PrivchatApplicationAuthProvider.new(_ensure_auth())
+	return _default_provider.refresh
+
+
 func _clear_session() -> void:
 	_auth_generation += 1
 	logged_in_user_id = -1
 	logged_in_device_id = ""
 	refresh_token_value = ""
+
+
+## 同一代际内只广播一次,避免多个界面重复跳登录页。
+func _broadcast_logout(code: int, reason: String) -> void:
+	if _logout_broadcast:
+		return
+	_logout_broadcast = true
+	logout_required.emit(code, reason)
 
 
 ## 宿主主动登出:推进代际,让在途刷新结果失效。
@@ -303,6 +335,7 @@ func authenticate(user_id: int, access_token: String, device_id: String,
 		# 记住身份:send_text 等以此作 from_uid,漏记会导致用 -1 发信。
 		logged_in_user_id = user_id
 		logged_in_device_id = device_id
+		_logout_broadcast = false   # 新会话:允许下一次终态再广播
 	return result
 
 
@@ -333,6 +366,9 @@ func subscribe_channel(channel_id: int, channel_type: int, token: String = "",
 		timeout_ms: int = 10000) -> Dictionary:
 	if native == null:
 		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.subscribe_channel(channel_id, channel_type, token, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -341,6 +377,9 @@ func unsubscribe_channel(channel_id: int, channel_type: int,
 		timeout_ms: int = 10000) -> Dictionary:
 	if native == null:
 		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.unsubscribe_channel(channel_id, channel_type, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -362,6 +401,9 @@ func transfer(channel_id: int, route: String, body: Dictionary,
 		timeout_ms: int = 8000) -> Dictionary:
 	if native == null:
 		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.transfer(channel_id, route, body, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -370,6 +412,9 @@ func transfer(channel_id: int, route: String, body: Dictionary,
 func rpc_call(route: String, body: Dictionary, timeout_ms: int = 8000) -> Dictionary:
 	if native == null:
 		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.rpc_call(route, body, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -377,6 +422,9 @@ func rpc_call(route: String, body: Dictionary, timeout_ms: int = 8000) -> Dictio
 func sync_channel(channel_id: int, channel_type: int, timeout_ms: int = 15000) -> Dictionary:
 	if native == null:
 		return _not_started()
+	var gate := await _gate_network()
+	if not gate.is_empty():
+		return { "ok": false, "data": null, "error": gate }
 	var rid: int = native.sync_channel(channel_id, channel_type, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -588,7 +636,7 @@ func _on_sdk_event(sequence_id: int, timestamp_ms: int, kind: String,
 			_clear_session()
 			session_expired.emit(int(body.get("code", 0)),
 					str(body.get("message", "")), str(body.get("source", "")))
-			logout_required.emit(int(body.get("code", 0)), str(body.get("message", "")))
+			_broadcast_logout(int(body.get("code", 0)), str(body.get("message", "")))
 		"AccessTokenRefreshNeeded":
 			var body: Dictionary = event.get("event", {}).get("AccessTokenRefreshNeeded", {})
 			token_refresh_needed.emit(int(body.get("code", 0)),
