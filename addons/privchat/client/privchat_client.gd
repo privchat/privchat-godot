@@ -16,8 +16,14 @@ signal connection_state_changed(from_state: String, to_state: String)
 signal message_sent(request_id: int, ok: bool, message_id: int, error: String)
 ## 登录态不可自愈(ForcedLogout):宿主须清理登录态并回登录页。
 signal session_expired(code: int, message: String, source: String)
-## access token 需业务层刷新(AccessTokenRefreshNeeded):刷新后重新 authenticate。
+## access token 需刷新(AccessTokenRefreshNeeded)。默认已由本类自动接管
+## (single-flight refresh → authenticate);宿主一般只需监听 auth_recovered。
 signal token_refresh_needed(code: int, message: String)
+## 一次 token 恢复流程的结果(刷新 + 重新 authenticate)。
+signal auth_recovered(ok: bool, error: String)
+## 会话终结、必须回登录页:refresh token 失效/被撤销,或服务端强制登出。
+## 发出前登录态已清理;**不会**再自动重试,避免无限刷新循环。
+signal logout_required(code: int, reason: String)
 
 # TaskKind ordinals — must match PrivchatNativeClient::TaskKind.
 const KIND_AUTHENTICATE := 0
@@ -58,6 +64,18 @@ var auth: PrivchatPlatformAuthClient = null
 
 var logged_in_user_id: int = -1
 var logged_in_device_id: String = ""
+## 由 login() 保存;宿主自管 token 时也可直接赋值。SDK 层永不上送它,
+## 只交给 token_provider(见下)——契约见 spec TOKEN_REFRESH_SPEC §3。
+var refresh_token_value: String = ""
+
+## Token 来源钩子。签名:func(refresh_token: String, device_id: String) -> Dictionary
+##   返回 { ok, data: { user_id, access_token, refresh_token }, error, terminal: bool }
+## 留空时使用内置的 privchat-application member 模块刷新(模式 B)。
+## 模式 C(业务后台自有 token 体系)由宿主赋值覆盖,addon 不预设业务路由。
+var token_provider: Callable = Callable()
+
+var _refreshing := false           # single-flight 闸门
+var _auth_generation: int = 0      # 登录代际:旧刷新结果不得覆盖新会话
 
 var _results: Dictionary = {}      # request_id -> result Dictionary
 var _abandoned: Dictionary = {}    # request_id -> true(已超时,结果迟到即丢弃)
@@ -152,11 +170,122 @@ func login(mobile: String, sms_code: String) -> Dictionary:
 
 	logged_in_user_id = int(data.user_id)
 	logged_in_device_id = data.device_id
+	refresh_token_value = str(data.get("refresh_token", ""))
+	_auth_generation += 1   # 新会话:此前在途的刷新结果作废
 	return { "ok": true, "error": "", "user_id": logged_in_user_id }
 
 
 func send_sms_code(mobile: String) -> Dictionary:
 	return await _ensure_auth().send_sms_code(mobile)
+
+
+# ---------------------------------------------------------------------------
+# Token 生命周期(契约见 spec TOKEN_REFRESH_SPEC)
+#
+# 状态机:
+#   idle --token_refresh_needed/refresh_now()--> refreshing
+#   refreshing --provider ok--> authenticate --ok--> idle(emit auth_recovered(true))
+#   refreshing --provider terminal--> cleared(emit logout_required,不再重试)
+#   refreshing --provider transient--> idle(emit auth_recovered(false),等下次事件)
+#   任意状态 --ForcedLogout--> cleared(emit logout_required)
+#
+# 边界:SDK 不持业务 token 策略。本类只做编排(single-flight、代际保护、
+# 重新 authenticate);新 token 从 token_provider 取,默认走内置的
+# privchat-application member 刷新,模式 C 由宿主覆盖。
+# ---------------------------------------------------------------------------
+
+## 是否正在刷新。刷新期间本地读(local-first)照常可用,不做全局阻塞 ——
+## 阻塞会违反 spec §7.1 的离线可用契约。
+func is_refreshing() -> bool:
+	return _refreshing
+
+
+## 等待刷新结束(仅供需要串行化的调用方);未在刷新时立即返回。
+func await_auth_ready(timeout_ms: int = 15000) -> bool:
+	var deadline := Time.get_ticks_msec() + timeout_ms
+	while _refreshing and Time.get_ticks_msec() < deadline:
+		if not is_inside_tree():
+			return false
+		await get_tree().process_frame
+	return not _refreshing
+
+
+## 主动触发一次 token 恢复(收到 10002、或宿主自行判定过期时调用)。
+## single-flight:并发调用只会真正刷新一次,其余等待同一结果。
+## 返回 { ok, error, terminal }。
+func refresh_now() -> Dictionary:
+	if _refreshing:
+		var settled := await await_auth_ready()
+		return { "ok": settled and logged_in_user_id >= 0, "error": "", "terminal": false }
+	if native == null:
+		return { "ok": false, "error": "client not started", "terminal": false }
+
+	_refreshing = true
+	var generation := _auth_generation
+	var device_id := logged_in_device_id
+	var result := await _run_refresh(generation, device_id)
+	# 代际变化 = 期间发生了登出/重新登录,旧结果一律作废,不得覆盖新会话。
+	if _auth_generation != generation:
+		_refreshing = false
+		return { "ok": false, "error": "superseded by a newer session", "terminal": false }
+	_refreshing = false
+
+	if result.terminal:
+		_clear_session()
+		logout_required.emit(int(result.get("code", 0)), str(result.error))
+	else:
+		auth_recovered.emit(result.ok, str(result.error))
+	return result
+
+
+func _run_refresh(generation: int, device_id: String) -> Dictionary:
+	if refresh_token_value.is_empty() and not token_provider.is_valid():
+		return { "ok": false, "error": "no refresh token and no token_provider", "terminal": true }
+
+	var provided: Dictionary
+	if token_provider.is_valid():
+		provided = await token_provider.call(refresh_token_value, device_id)
+	else:
+		provided = await _ensure_auth().refresh_token(refresh_token_value, device_id)
+		# member 模块拒绝刷新 = refresh token 失效/被撤销 → 终态,不再重试。
+		if not provided.get("ok", false):
+			provided["terminal"] = true
+
+	if not provided.get("ok", false):
+		return { "ok": false, "error": str(provided.get("error", "refresh failed")),
+				"terminal": bool(provided.get("terminal", false)) }
+	# 刷新期间会话已被替换/登出。
+	if _auth_generation != generation:
+		return { "ok": false, "error": "superseded", "terminal": false }
+
+	var data: Dictionary = provided.get("data", {})
+	var new_access := str(data.get("access_token", ""))
+	if new_access.is_empty():
+		return { "ok": false, "error": "provider returned no access_token", "terminal": true }
+	if not str(data.get("refresh_token", "")).is_empty():
+		refresh_token_value = str(data.refresh_token)   # rotation
+
+	# 契约(TOKEN_REFRESH_SPEC §3.1.1):SDK 已把 transport 拉回 Connected,
+	# 这里**只能** authenticate;再调 connect() 会用旧 token 触发死循环。
+	var uid := int(data.get("user_id", logged_in_user_id))
+	var auth_resp: Dictionary = await authenticate(uid, new_access,
+			str(data.get("device_id", device_id)) if not str(data.get("device_id", "")).is_empty() else device_id)
+	if not auth_resp.ok:
+		return { "ok": false, "error": "re-authenticate: " + str(auth_resp.error), "terminal": false }
+	return { "ok": true, "error": "", "terminal": false }
+
+
+## 清理登录态(终态失败/强制登出)。不触碰 native 连接,由宿主决定去留。
+func _clear_session() -> void:
+	_auth_generation += 1
+	logged_in_user_id = -1
+	logged_in_device_id = ""
+	refresh_token_value = ""
+
+
+## 宿主主动登出:推进代际,让在途刷新结果失效。
+func forget_session() -> void:
+	_clear_session()
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +584,17 @@ func _on_sdk_event(sequence_id: int, timestamp_ms: int, kind: String,
 	match kind:
 		"ForcedLogout":
 			var body: Dictionary = event.get("event", {}).get("ForcedLogout", {})
+			# 终态:清会话、推进代际(作废在途刷新),不再重试。
+			_clear_session()
 			session_expired.emit(int(body.get("code", 0)),
 					str(body.get("message", "")), str(body.get("source", "")))
+			logout_required.emit(int(body.get("code", 0)), str(body.get("message", "")))
 		"AccessTokenRefreshNeeded":
 			var body: Dictionary = event.get("event", {}).get("AccessTokenRefreshNeeded", {})
 			token_refresh_needed.emit(int(body.get("code", 0)),
 					str(body.get("message", "")))
+			# 自动接管恢复流程(single-flight;重复事件不会叠加刷新)。
+			refresh_now()
 	sdk_event.emit(sequence_id, timestamp_ms, kind, event)
 
 
