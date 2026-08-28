@@ -9,6 +9,7 @@ native/godot-cpp/
 # scons build intermediates
 native/*.os
 native/src/*.os
+native/.sconsign.dblite
 
 # macOS noise
 .DS_Store
