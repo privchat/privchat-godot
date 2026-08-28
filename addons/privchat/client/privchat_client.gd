@@ -60,6 +60,18 @@ var logged_in_user_id: int = -1
 var logged_in_device_id: String = ""
 
 var _results: Dictionary = {}      # request_id -> result Dictionary
+var _abandoned: Dictionary = {}    # request_id -> true(已超时,结果迟到即丢弃)
+var _inflight: int = 0             # 在途 await 数(供服务安全释放前排空)
+
+
+## 当前在途请求数。宿主/服务在释放前可据此排空,避免协程状态泄漏。
+func inflight_count() -> int:
+	return _inflight
+
+
+## 未 start() 就调用时的统一失败返回:降级为错误,不得崩溃。
+func _not_started() -> Dictionary:
+	return { "ok": false, "data": null, "error": "client not started (call start() first)" }
 
 
 func _ready() -> void:
@@ -154,16 +166,27 @@ func send_sms_code(mobile: String) -> Dictionary:
 
 func authenticate(user_id: int, access_token: String, device_id: String,
 		timeout_ms: int = 15000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.authenticate(user_id, access_token, device_id, timeout_ms)
-	return await _await_request(rid, timeout_ms)
+	var result: Dictionary = await _await_request(rid, timeout_ms)
+	if result.ok:
+		# 记住身份:send_text 等以此作 from_uid,漏记会导致用 -1 发信。
+		logged_in_user_id = user_id
+		logged_in_device_id = device_id
+	return result
 
 
 func connect_im(timeout_ms: int = 15000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.connect_async(timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 func disconnect_im(timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.disconnect_async(timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -171,18 +194,24 @@ func disconnect_im(timeout_ms: int = 10000) -> Dictionary:
 ## Bootstrap sync gate：authenticate+connect 后、任何本地优先操作
 ## （发消息等）之前必须完成，对标 TS SDK 的 bootstrapChannels。
 func bootstrap_sync(timeout_ms: int = 30000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.run_bootstrap_sync(timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 func subscribe_channel(channel_id: int, channel_type: int, token: String = "",
 		timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.subscribe_channel(channel_id, channel_type, token, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 func unsubscribe_channel(channel_id: int, channel_type: int,
 		timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.unsubscribe_channel(channel_id, channel_type, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -191,6 +220,8 @@ func unsubscribe_channel(channel_id: int, channel_type: int,
 ## Delivery progress arrives via sdk_event (MessageSendStatusChanged).
 func send_text(channel_id: int, channel_type: int, content: String,
 		timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.send_text_message(channel_id, channel_type,
 			logged_in_user_id, content, timeout_ms)
 	return await _await_request(rid, timeout_ms)
@@ -200,23 +231,31 @@ func send_text(channel_id: int, channel_type: int, content: String,
 ## data 为 transfer 信封 {"request_id","channel_id","code","message","data"}。
 func transfer(channel_id: int, route: String, body: Dictionary,
 		timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.transfer(channel_id, route, body, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 ## 全局 RPC。body 是 Dictionary;返回 { ok, data, error },data 为服务端响应对象。
 func rpc_call(route: String, body: Dictionary, timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.rpc_call(route, body, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 func sync_channel(channel_id: int, channel_type: int, timeout_ms: int = 15000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.sync_channel(channel_id, channel_type, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
 
 ## 返回 { ok, data: StoredMessage Dictionary | null, error }。
 func get_message_by_id(message_id: int, timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.get_message_by_id(message_id, timeout_ms)
 	return await _await_request(rid, timeout_ms)
 
@@ -249,6 +288,8 @@ func get_or_create_direct_channel(peer_user_id: int) -> Dictionary:
 ## 返回 { ok, error, messages: Array(显示序 DESC), has_more_before, fetched_from_server }。
 func open_conversation(channel_id: int, channel_type: int, limit: int = 50,
 		timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.open_conversation(channel_id, channel_type, limit, timeout_ms)
 	return _page_view(await _await_request(rid, timeout_ms))
 
@@ -257,6 +298,8 @@ func open_conversation(channel_id: int, channel_type: int, limit: int = 50,
 func load_older_history(channel_id: int, channel_type: int,
 		before_server_message_id: int, limit: int = 50,
 		timeout_ms: int = 10000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.load_older_history(channel_id, channel_type,
 			before_server_message_id, limit, timeout_ms)
 	return _page_view(await _await_request(rid, timeout_ms))
@@ -265,6 +308,8 @@ func load_older_history(channel_id: int, channel_type: int,
 ## 纯本地分页读(不触网)。返回 { ok, error, messages: Array }。
 func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 		offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.list_messages(channel_id, channel_type, limit, offset, timeout_ms)
 	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.messages = result.data if typeof(result.data) == TYPE_ARRAY else []
@@ -274,6 +319,8 @@ func list_messages(channel_id: int, channel_type: int, limit: int = 50,
 ## 本地会话列表;条目自带 unread_count/top/mute/last_msg_timestamp/last_msg_content。
 ## 返回 { ok, error, channels: Array }(已按 top 优先、last_msg_timestamp 降序排序)。
 func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.list_channels(limit, offset, timeout_ms)
 	var result: Dictionary = await _await_request(rid, timeout_ms)
 	var channels: Array = result.data if typeof(result.data) == TYPE_ARRAY else []
@@ -288,6 +335,8 @@ func list_channels(limit: int = 50, offset: int = 0, timeout_ms: int = 8000) -> 
 ## 已读游标推进:RPC 上报 + 本地投影。返回 { ok, error, last_read_pts: int }。
 func mark_read_to_pts(channel_id: int, read_pts: int,
 		timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.mark_read_to_pts(channel_id, read_pts, timeout_ms)
 	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.last_read_pts = _data_int(result, "last_read_pts")
@@ -297,6 +346,8 @@ func mark_read_to_pts(channel_id: int, read_pts: int,
 ## 单频道未读数(本地)。返回 { ok, error, count: int }。
 func get_channel_unread_count(channel_id: int, channel_type: int,
 		timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.get_channel_unread_count(channel_id, channel_type, timeout_ms)
 	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.count = _data_int(result, "count")
@@ -306,6 +357,8 @@ func get_channel_unread_count(channel_id: int, channel_type: int,
 ## 全局未读角标(本地)。返回 { ok, error, count: int }。
 func get_total_unread_count(exclude_muted: bool = false,
 		timeout_ms: int = 8000) -> Dictionary:
+	if native == null:
+		return _not_started()
 	var rid: int = native.get_total_unread_count(exclude_muted, timeout_ms)
 	var result: Dictionary = await _await_request(rid, timeout_ms)
 	result.count = _data_int(result, "count")
@@ -358,20 +411,41 @@ func _data_int(result: Dictionary, key: String) -> int:
 
 
 ## 每次 await 带硬超时护栏(timeout_ms + 5s 宽限):native 永不应答时
-## 返回失败而不是永久挂起。
+## 返回失败而不是永久挂起。超时的 rid 记入 _abandoned,迟到结果直接丢弃,
+## 否则 _results 会无限增长。
 func _await_request(rid: int, timeout_ms: int = 30000) -> Dictionary:
+	_inflight += 1
+	var result := await _await_request_inner(rid, timeout_ms)
+	_inflight -= 1
+	return result
+
+
+func _await_request_inner(rid: int, timeout_ms: int) -> Dictionary:
 	var deadline := Time.get_ticks_msec() + timeout_ms + 5000
 	while not _results.has(rid):
 		if Time.get_ticks_msec() > deadline:
+			# native 若彻底失联,结果永不到达,标记也无人清除 —— 故封顶。
+			if _abandoned.size() > 1024:
+				_abandoned.clear()
+			_abandoned[rid] = true
 			return { "ok": false, "data": null, "error": "request timeout (rid=%d)" % rid }
+		# 节点已被移出场景树(宿主切场景/释放)时不再等待,避免 get_tree() 为 null。
+		if not is_inside_tree():
+			return { "ok": false, "data": null, "error": "client detached while awaiting" }
 		await get_tree().process_frame
 	var result: Dictionary = _results[rid]
 	_results.erase(rid)
 	return result
 
 
-func _on_request_completed(request_id: int, _kind: int, ok: bool,
+func _on_request_completed(request_id: int, kind: int, ok: bool,
 		data, error: String) -> void:
+	if _abandoned.has(request_id):
+		# 请求早已超时返回,丢弃迟到结果。SendText 随后还会发 message_sent,
+		# 标记留给它清除;其余类型到此为止,就地清除。
+		if kind != KIND_SEND_TEXT:
+			_abandoned.erase(request_id)
+		return
 	_results[request_id] = { "ok": ok, "data": data, "error": error }
 
 
@@ -397,6 +471,7 @@ func _on_connection_state_changed(from_state: String, to_state: String) -> void:
 func _on_message_sent(request_id: int, ok: bool, message_id: int, error: String) -> void:
 	# SendText 结果以本信号为准（native 先发 request_completed 再发本信号，
 	# 这里覆盖补齐 message_id，否则 send_text 的 await 永远拿不到结果）。
-	_results[request_id] = { "ok": ok, "data": null, "error": error,
-			"message_id": message_id }
+	if _abandoned.erase(request_id) == false:
+		_results[request_id] = { "ok": ok, "data": null, "error": error,
+				"message_id": message_id }
 	message_sent.emit(request_id, ok, message_id, error)

@@ -29,6 +29,7 @@ var client: PrivchatClient = null
 var game_channel_id: int = 0
 
 var _ticket := ""
+var _rejoining := false        # 重订阅 in-flight 闸门(状态抖动不叠加)
 var _next_request_id: int = 1
 var _seen_event_ids := {}      # server_message_id -> true
 
@@ -39,6 +40,20 @@ func setup(p_client: PrivchatClient) -> void:
 		client.sdk_event.connect(_on_sdk_event)
 	if not client.connection_state_changed.is_connected(_on_connection_state):
 		client.connection_state_changed.connect(_on_connection_state)
+
+
+## 安全释放:切场景/离开牌桌时用 `await game.close()` 代替 queue_free()。
+## 直接释放会让在途 await 的协程永远无法恢复(GDScriptFunctionState 泄漏)。
+func close(timeout_ms: int = 5000) -> void:
+	if client != null:
+		if client.sdk_event.is_connected(_on_sdk_event):
+			client.sdk_event.disconnect(_on_sdk_event)
+		if client.connection_state_changed.is_connected(_on_connection_state):
+			client.connection_state_changed.disconnect(_on_connection_state)
+		var deadline := Time.get_ticks_msec() + timeout_ms
+		while client.inflight_count() > 0 and Time.get_ticks_msec() < deadline:
+			await get_tree().process_frame
+	queue_free()
 
 
 # --- 频道生命周期 -----------------------------------------------------------
@@ -64,12 +79,19 @@ func leave() -> Dictionary:
 
 
 ## 重连完成(→ Authenticated)后自动重订阅游戏频道(spec §7.1)。
+## 状态抖动时只保留一次 in-flight 重订阅,避免订阅风暴。
 func _on_connection_state(_from_state: String, to_state: String) -> void:
-	if to_state != "Authenticated" or game_channel_id == 0:
+	if to_state != "Authenticated" or game_channel_id == 0 or _rejoining:
 		return
+	_rejoining = true
+	var target := game_channel_id
 	var resp: Dictionary = await client.subscribe_channel(
-			game_channel_id, ROOM_CHANNEL_TYPE, _ticket)
-	rejoined.emit(resp.ok, str(resp.get("error", "")))
+			target, ROOM_CHANNEL_TYPE, _ticket)
+	if not is_instance_valid(self):
+		return
+	_rejoining = false
+	if game_channel_id == target:
+		rejoined.emit(resp.ok, str(resp.get("error", "")))
 
 
 # --- 指令与 RPC -------------------------------------------------------------

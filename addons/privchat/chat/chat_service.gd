@@ -35,6 +35,7 @@ var channel_type: int = 1
 var room_channel_id: int = 0
 
 var _room_ticket := ""
+var _rejoining := false        # 重订阅 in-flight 闸门(状态抖动不叠加)
 var _seen_room_ids := {}       # server_message_id -> true
 var _seen_timeline := {}       # "channel:message_id" -> true
 
@@ -45,6 +46,21 @@ func setup(p_client: PrivchatClient) -> void:
 		client.sdk_event.connect(_on_sdk_event)
 	if not client.connection_state_changed.is_connected(_on_connection_state):
 		client.connection_state_changed.connect(_on_connection_state)
+
+
+## 安全释放:切场景/退出会话时用 `await chat.close()` 代替 queue_free()。
+## 直接释放会让在途 await 的协程永远无法恢复(GDScriptFunctionState 泄漏);
+## 这里先断开信号、排空在途请求,再释放节点。
+func close(timeout_ms: int = 5000) -> void:
+	if client != null:
+		if client.sdk_event.is_connected(_on_sdk_event):
+			client.sdk_event.disconnect(_on_sdk_event)
+		if client.connection_state_changed.is_connected(_on_connection_state):
+			client.connection_state_changed.disconnect(_on_connection_state)
+		var deadline := Time.get_ticks_msec() + timeout_ms
+		while client.inflight_count() > 0 and Time.get_ticks_msec() < deadline:
+			await get_tree().process_frame
+	queue_free()
 
 
 # --- 会话生命周期 -----------------------------------------------------------
@@ -109,12 +125,21 @@ func leave_room() -> Dictionary:
 
 
 ## 重连完成(→ Authenticated)后自动重订阅已加入的 Room(spec §7.1)。
+## 状态抖动时只保留一次 in-flight 重订阅,避免订阅风暴。
 func _on_connection_state(_from_state: String, to_state: String) -> void:
-	if to_state != "Authenticated" or room_channel_id == 0:
+	if to_state != "Authenticated" or room_channel_id == 0 or _rejoining:
 		return
+	_rejoining = true
+	var target := room_channel_id
 	var resp: Dictionary = await client.subscribe_channel(
-			room_channel_id, ROOM_CHANNEL_TYPE, _room_ticket)
-	room_rejoined.emit(resp.ok, str(resp.get("error", "")))
+			target, ROOM_CHANNEL_TYPE, _room_ticket)
+	# await 期间宿主可能已切场景释放本节点。
+	if not is_instance_valid(self):
+		return
+	_rejoining = false
+	# 重订阅返回前若已 leave_room,结果作废。
+	if room_channel_id == target:
+		room_rejoined.emit(resp.ok, str(resp.get("error", "")))
 
 
 # --- 事件分发 ---------------------------------------------------------------
@@ -144,6 +169,9 @@ func _handle_timeline(event: Dictionary) -> void:
 		return
 	_remember(_seen_timeline, key)
 	var resp: Dictionary = await client.get_message_by_id(message_id)
+	# await 期间宿主可能已切场景释放本节点。
+	if not is_instance_valid(self):
+		return
 	if resp.ok and typeof(resp.data) == TYPE_DICTIONARY:
 		message_received.emit(resp.data)
 	var unread: Dictionary = await client.get_channel_unread_count(channel_id, channel_type)
