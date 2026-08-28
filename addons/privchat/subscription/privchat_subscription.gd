@@ -4,26 +4,29 @@
 # 职责只有订阅这一件事:
 #   - subscribe/unsubscribe:带票据的订阅生命周期
 #   - 记住频道与票据,重连(→ Authenticated)后自动重订阅
-#   - 按频道过滤服务端广播,按 server_message_id 去重(重连重放防抖)
+#   - 按频道过滤服务端广播并原样转发(含 topic)
 #   - close():排空在途请求后安全释放
+#
+# 去重不在本层:privchat-sdk 已按 (channel_id, server_message_id) 去重
+# (ROOM_CHANNEL_SPEC §P1-05,窗口 256),重复帧不会进入事件流;无 id 的
+# 状态帧(如 presence_changed)由 SDK 单独消化。本层再去重既冗余,又会
+# 误吞那些"每帧都要应用"的状态帧。
 #
 # 本类不认识任何业务语义(不知道频道里跑的是聊天、对局还是通知);
 # 谁订阅什么频道、载荷怎么解释,全由调用方决定。
 class_name PrivchatSubscription
 extends Node
 
-## 服务端广播(已按频道过滤 + 按 server_message_id 去重)。
-## payload_text 为 UTF-8 文本视图,原始字节在 payload_bytes。
+## 服务端广播(已按频道过滤;去重由 privchat-sdk 完成)。
+## payload_text 为 UTF-8 文本视图,原始字节在 payload_bytes;
+## topic 由服务端标注,调用方可据此分流(空字符串表示未标注)。
 signal message_received(payload_text: String, payload_bytes: PackedByteArray,
-		publisher: String, server_message_id: int, timestamp: int)
+		topic: String, publisher: String, server_message_id: int, timestamp: int)
 ## 重连后自动重订阅的结果;失败(如票据过期)由调用方重新签票再 subscribe。
 signal resubscribed(ok: bool, error: String)
 
 ## privchat-sdk 的 Room 频道类型(见 spec ROOM_CHANNEL_SPEC)。
 const ROOM_CHANNEL_TYPE := 2
-# 去重集合封顶(spec GODOT_SDK_SPEC §7.1)。
-const SEEN_CAP := 4096
-const SEEN_EVICT := 1024
 
 var client: PrivchatClient = null
 var channel_id: int = 0
@@ -31,7 +34,6 @@ var channel_type: int = ROOM_CHANNEL_TYPE
 
 var _ticket := ""
 var _resubscribing := false    # 重订阅 in-flight 闸门(状态抖动不叠加)
-var _seen_ids := {}            # server_message_id -> true
 
 
 func setup(p_client: PrivchatClient) -> void:
@@ -77,7 +79,6 @@ func unsubscribe() -> Dictionary:
 	var resp: Dictionary = await client.unsubscribe_channel(channel_id, channel_type)
 	channel_id = 0
 	_ticket = ""
-	_seen_ids.clear()
 	return resp
 
 
@@ -113,17 +114,10 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 		return
 	var server_message_id: int = int(body.get("server_message_id", 0) \
 			if body.get("server_message_id") != null else 0)
-	if server_message_id != 0:
-		if _seen_ids.has(server_message_id):
-			return
-		_seen_ids[server_message_id] = true
-		if _seen_ids.size() > SEEN_CAP:
-			var keys := _seen_ids.keys()
-			for i in range(SEEN_EVICT):
-				_seen_ids.erase(keys[i])
 	var bytes := PackedByteArray()
 	for b in body.get("payload", []):
 		bytes.append(int(b))
 	message_received.emit(bytes.get_string_from_utf8(), bytes,
+			str(body.get("topic", "") if body.get("topic") != null else ""),
 			str(body.get("publisher", "")), server_message_id,
 			int(body.get("timestamp", 0)))

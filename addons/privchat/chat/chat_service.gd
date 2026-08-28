@@ -122,7 +122,8 @@ func _ensure_sub() -> PrivchatSubscription:
 
 
 func _on_subscription_message(payload_text: String, _bytes: PackedByteArray,
-		publisher: String, server_message_id: int, _timestamp: int) -> void:
+		_topic: String, publisher: String, server_message_id: int,
+		_timestamp: int) -> void:
 	room_message.emit(payload_text, publisher, server_message_id)
 
 
