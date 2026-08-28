@@ -1,4 +1,4 @@
-# chat_service.gd — 面向 UI 的会话服务(单会话上下文 + Room 世界频道)。
+# chat_service.gd — 面向 UI 的 IM 会话服务(单会话上下文)。
 #
 # 职责:把 PrivchatClient 的低层 awaitable + sdk_event 流,收敛成一个
 # 频道视角的聊天 API:打开会话(local-first 历史)、上滑翻页、发送、已读、
@@ -24,7 +24,6 @@ signal unread_changed(channel_id: int, count: int)
 ## 重连后自动重订阅 Room 的结果;失败(如 ticket 过期)由业务重新签票再 join。
 signal room_rejoined(ok: bool, error: String)
 
-const ROOM_CHANNEL_TYPE := 2
 # 去重集合封顶(spec §7.1):超限批量淘汰最旧,超长在线不无界增长。
 const SEEN_CAP := 4096
 const SEEN_EVICT := 1024
@@ -32,11 +31,10 @@ const SEEN_EVICT := 1024
 var client: PrivchatClient = null
 var channel_id: int = 0
 var channel_type: int = 1
-var room_channel_id: int = 0
+var room_channel_id: int:
+	get: return _sub.channel_id if _sub != null else 0
 
-var _room_ticket := ""
-var _rejoining := false        # 重订阅 in-flight 闸门(状态抖动不叠加)
-var _seen_room_ids := {}       # server_message_id -> true
+var _sub: PrivchatSubscription = null   # Room 订阅原语(懒建)
 var _seen_timeline := {}       # "channel:message_id" -> true
 
 
@@ -44,8 +42,6 @@ func setup(p_client: PrivchatClient) -> void:
 	client = p_client
 	if not client.sdk_event.is_connected(_on_sdk_event):
 		client.sdk_event.connect(_on_sdk_event)
-	if not client.connection_state_changed.is_connected(_on_connection_state):
-		client.connection_state_changed.connect(_on_connection_state)
 
 
 ## 安全释放:切场景/退出会话时用 `await chat.close()` 代替 queue_free()。
@@ -55,8 +51,6 @@ func close(timeout_ms: int = 5000) -> void:
 	if client != null:
 		if client.sdk_event.is_connected(_on_sdk_event):
 			client.sdk_event.disconnect(_on_sdk_event)
-		if client.connection_state_changed.is_connected(_on_connection_state):
-			client.connection_state_changed.disconnect(_on_connection_state)
 		var deadline := Time.get_ticks_msec() + timeout_ms
 		while client.inflight_count() > 0 and Time.get_ticks_msec() < deadline:
 			await get_tree().process_frame
@@ -103,43 +97,33 @@ func channel_list(limit: int = 50, offset: int = 0) -> Dictionary:
 	return await client.list_channels(limit, offset)
 
 
-# --- Room 世界频道 ----------------------------------------------------------
+# --- 频道订阅(委托给通用订阅原语)-------------------------------------------
+# Room 订阅本身与"聊天"无关,统一由 PrivchatSubscription 承担:
+# 订阅生命周期、重连自动重订阅、按 server_message_id 去重都在那里实现。
 
 func join_room(p_room_channel_id: int, ticket: String) -> Dictionary:
-	var resp: Dictionary = await client.subscribe_channel(
-			p_room_channel_id, ROOM_CHANNEL_TYPE, ticket)
-	if resp.ok:
-		room_channel_id = p_room_channel_id
-		_room_ticket = ticket
-	return resp
+	return await _ensure_sub().subscribe(p_room_channel_id, ticket)
 
 
 func leave_room() -> Dictionary:
-	if room_channel_id == 0:
+	if _sub == null:
 		return { "ok": true, "error": "", "data": null }
-	var resp: Dictionary = await client.unsubscribe_channel(room_channel_id, ROOM_CHANNEL_TYPE)
-	room_channel_id = 0
-	_room_ticket = ""
-	_seen_room_ids.clear()
-	return resp
+	return await _sub.unsubscribe()
 
 
-## 重连完成(→ Authenticated)后自动重订阅已加入的 Room(spec §7.1)。
-## 状态抖动时只保留一次 in-flight 重订阅,避免订阅风暴。
-func _on_connection_state(_from_state: String, to_state: String) -> void:
-	if to_state != "Authenticated" or room_channel_id == 0 or _rejoining:
-		return
-	_rejoining = true
-	var target := room_channel_id
-	var resp: Dictionary = await client.subscribe_channel(
-			target, ROOM_CHANNEL_TYPE, _room_ticket)
-	# await 期间宿主可能已切场景释放本节点。
-	if not is_instance_valid(self):
-		return
-	_rejoining = false
-	# 重订阅返回前若已 leave_room,结果作废。
-	if room_channel_id == target:
-		room_rejoined.emit(resp.ok, str(resp.get("error", "")))
+func _ensure_sub() -> PrivchatSubscription:
+	if _sub == null:
+		_sub = PrivchatSubscription.new()
+		add_child(_sub)
+		_sub.setup(client)
+		_sub.message_received.connect(_on_subscription_message)
+		_sub.resubscribed.connect(func(ok, err): room_rejoined.emit(ok, err))
+	return _sub
+
+
+func _on_subscription_message(payload_text: String, _bytes: PackedByteArray,
+		publisher: String, server_message_id: int, _timestamp: int) -> void:
+	room_message.emit(payload_text, publisher, server_message_id)
 
 
 # --- 事件分发 ---------------------------------------------------------------
@@ -150,8 +134,6 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 			_handle_timeline(event)
 		"MessageSendStatusChanged":
 			_handle_send_status(event)
-		"SubscriptionMessageReceived":
-			_handle_room_broadcast(event)
 
 
 func _handle_timeline(event: Dictionary) -> void:
@@ -186,24 +168,6 @@ func _handle_send_status(event: Dictionary) -> void:
 	send_status_changed.emit(int(body.get("message_id", 0)),
 			int(body.get("status", 0)),
 			int(body.get("server_message_id", 0) if body.get("server_message_id") != null else 0))
-
-
-func _handle_room_broadcast(event: Dictionary) -> void:
-	var body := _event_body(event, "SubscriptionMessageReceived")
-	if int(body.get("channel_id", -1)) != room_channel_id:
-		return
-	var server_message_id: int = int(body.get("server_message_id", 0) \
-			if body.get("server_message_id") != null else 0)
-	# 重连重放防抖:同一 server_message_id 只发一次。
-	if server_message_id != 0 and _seen_room_ids.has(server_message_id):
-		return
-	if server_message_id != 0:
-		_remember(_seen_room_ids, server_message_id)
-	var bytes := PackedByteArray()
-	for b in body.get("payload", []):
-		bytes.append(int(b))
-	room_message.emit(bytes.get_string_from_utf8(),
-			str(body.get("publisher", "")), server_message_id)
 
 
 ## 记入去重集合,超限批量淘汰最旧(Godot Dictionary 保持插入序)。

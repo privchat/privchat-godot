@@ -11,6 +11,18 @@ The extension talks to the SDK **only** through the C ABI in
 `privchat-sdk-c-api` (`privchat_sdk_c_api.h`). UniFFI is the binding layer for
 Kotlin/Swift and is not used, included, or linked here.
 
+## Scope
+
+This addon wraps privchat-sdk for Godot and has **no knowledge of games or
+business domains**. It exposes what the SDK itself provides: IM conversations
+(local-first, pts, unread, history), channel subscription, Channel Transfer and
+RPC passthrough, and platform sign-in via the privchat-application member
+module.
+
+Anything domain-specific — lobbies, matches, battles, inventories, gameplay
+routes, command idempotency conventions — belongs to the calling application.
+See `privchat-godot-demo` for how a business layer composes these primitives.
+
 ## Layout
 
 - `addons/privchat/` — the shipped addon: GDScript facade + `bin/` dylibs +
