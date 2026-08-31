@@ -59,16 +59,30 @@ scons platform=macos target=template_release arch=arm64 "$@"
 echo "==> staging artifacts into $BIN_DIR"
 mkdir -p "$BIN_DIR"
 cp "$SDK_REPO/target/release/libprivchat_sdk_c_api.dylib" "$BIN_DIR/"
+# cargo records an absolute build path as the dylib's own id; rewrite it so
+# anything linking against the staged copy records @rpath instead.
+install_name_tool -id @rpath/libprivchat_sdk_c_api.dylib "$BIN_DIR/libprivchat_sdk_c_api.dylib"
 codesign --force --sign - "$BIN_DIR/libprivchat_sdk_c_api.dylib" || true
 cp "$NATIVE_DIR/privchat.gdextension" "$ADDON_DIR/"
 DYLIB="$BIN_DIR/libprivchat_godot.macos.template_release.dylib"
 if [ -f "$DYLIB" ]; then
     # Point the SDK dependency at @loader_path so the bin/ copy is used.
-    OLD_DEP="$(otool -L "$DYLIB" | grep -o '[^ ]*libprivchat_sdk_c_api.dylib' | head -1 || true)"
+    # otool indents with a TAB, so the class must exclude all whitespace —
+    # `[^ ]*` keeps the tab, install_name_tool then matches nothing and
+    # silently leaves the absolute path in place (it warns, it does not fail).
+    OLD_DEP="$(otool -L "$DYLIB" | grep -o '[^[:space:]]*libprivchat_sdk_c_api.dylib' | head -1 || true)"
     if [ -n "$OLD_DEP" ] && [ "$OLD_DEP" != "@rpath/libprivchat_sdk_c_api.dylib" ]; then
         install_name_tool -change "$OLD_DEP" @rpath/libprivchat_sdk_c_api.dylib "$DYLIB"
     fi
     codesign --force --sign - "$DYLIB" || true
+fi
+
+# Guard: the staged extension must not reference anything outside the addon,
+# otherwise it loads only on the machine that built it.
+BAD="$(otool -L "$DYLIB" | tail -n +3 | grep -o '[^[:space:]]*libprivchat_sdk_c_api.dylib' | grep -v '^@rpath/' || true)"
+if [ -n "$BAD" ]; then
+    echo "ERROR: extension still references $BAD instead of @rpath" >&2
+    exit 1
 fi
 
 echo "==> done"

@@ -55,6 +55,17 @@ var transport: String = "Tcp"
 var use_tls: bool = false
 var ws_path: String = "/"
 var connection_timeout_secs: int = 10
+## 服务端 SPKI pin,base64(sha256(SubjectPublicKeyInfo)),QUIC 与 TLS/TCP 共用。
+##
+## **必填**:SDK 拒绝在没有 pin 的情况下建立 tcp:// 或 quic:// 连接
+## (tcp:// 是 TLS-only,不会退回明文)。支持多个是为了密钥轮换:
+## 先发同时接受 current+next 的客户端,再切服务端密钥。
+##
+## 取值(服务端证书由 privchat-server 的 gen-server-tls.sh 生成):
+##   openssl x509 -in certs/server.crt -pubkey -noout \
+##     | openssl pkey -pubin -outform der \
+##     | openssl dgst -sha256 -binary | openssl base64
+var spki_pins: PackedStringArray = PackedStringArray()
 ## Local SDK data dir (SQLite etc.); user:// is globalized before use.
 var data_dir: String = "user://privchat-data"
 ## privchat-application route-group root (auth / game HTTP APIs).
@@ -135,7 +146,13 @@ func start() -> bool:
 		}],
 		"connection_timeout_secs": connection_timeout_secs,
 		"data_dir": ProjectSettings.globalize_path(data_dir),
+		"spki_pins": Array(spki_pins),
 	}
+	if spki_pins.is_empty():
+		# 不在这里放行:SDK 会拒绝连接,报错文本却只说"没有配置 pin",
+		# 宿主容易误以为是网络问题。提前说清楚该去哪儿取值。
+		push_error("[privchat] spki_pins 为空 —— SDK 将拒绝建立 tcp:// / quic:// "
+				+ "连接。请设置服务端证书的 SPKI pin(见 spki_pins 注释)。")
 	var ok: bool = native.initialize(config)
 	if not ok:
 		push_error("[privchat] native initialize failed")
