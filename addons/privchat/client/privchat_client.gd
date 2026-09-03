@@ -79,6 +79,9 @@ var logged_in_device_id: String = ""
 ## 由 login() 保存;宿主自管 token 时也可直接赋值。SDK 层永不上送它,
 ## 只交给 token_provider(见下)——契约见 spec TOKEN_REFRESH_SPEC §3。
 var refresh_token_value: String = ""
+## 当前有效的应用 access token。业务层调 privchat-application 的模块路由
+## （`Authorization: Bearer`）时需要它;刷新后随之更新。
+var access_token: String = ""
 
 ## Token 来源 adapter(可替换)。签名:
 ##   func(refresh_token: String, device_id: String) -> Dictionary
@@ -175,6 +178,7 @@ func login(mobile: String, sms_code: String) -> Dictionary:
 	if not login_resp.ok:
 		return { "ok": false, "error": login_resp.error, "user_id": -1 }
 	var data: Dictionary = login_resp.data
+	access_token = str(data.access_token)
 
 	var auth_result: Dictionary = await authenticate(
 			int(data.user_id), data.access_token, data.device_id)
@@ -306,6 +310,7 @@ func _run_refresh(generation: int, device_id: String) -> Dictionary:
 			str(data.get("device_id", device_id)) if not str(data.get("device_id", "")).is_empty() else device_id)
 	if not auth_resp.ok:
 		return { "ok": false, "error": "re-authenticate: " + str(auth_resp.error), "terminal": false }
+	access_token = new_access
 	return { "ok": true, "error": "", "terminal": false }
 
 
