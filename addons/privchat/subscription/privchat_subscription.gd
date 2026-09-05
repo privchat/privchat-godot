@@ -24,6 +24,11 @@ signal message_received(payload_text: String, payload_bytes: PackedByteArray,
 		topic: String, publisher: String, server_message_id: int, timestamp: int)
 ## 重连后自动重订阅的结果;失败(如票据过期)由调用方重新签票再 subscribe。
 signal resubscribed(ok: bool, error: String)
+## 服务端定向推给本用户的 Channel Transfer(app→user,`POST /api/service/transfer/send`)。
+## 与 message_received(Room 广播,人人可见)相对:这是只发给你的 PRIVATE 事件。
+## payload_text 是 UTF-8 解码;二进制负载用 payload_bytes。
+signal transfer_received(route: String, payload_text: String, payload_bytes: PackedByteArray,
+		request_id: String)
 
 ## privchat-sdk 的 Room 频道类型(见 spec ROOM_CHANNEL_SPEC)。
 const ROOM_CHANNEL_TYPE := 2
@@ -105,6 +110,9 @@ func _on_connection_state(_from_state: String, to_state: String) -> void:
 # --- 事件分发 ---------------------------------------------------------------
 
 func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void:
+	if kind == "TransferReceived":
+		_on_transfer_received(event.get("event", {}).get("TransferReceived", {}))
+		return
 	if kind != "SubscriptionMessageReceived":
 		return
 	var body = event.get("event", {}).get("SubscriptionMessageReceived", {})
@@ -121,3 +129,13 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 			str(body.get("topic", "") if body.get("topic") != null else ""),
 			str(body.get("publisher", "")), server_message_id,
 			int(body.get("timestamp", 0)))
+
+
+func _on_transfer_received(body) -> void:
+	if typeof(body) != TYPE_DICTIONARY or int(body.get("channel_id", -1)) != channel_id:
+		return
+	var bytes := PackedByteArray()
+	for b in body.get("body", []):
+		bytes.append(int(b))
+	transfer_received.emit(str(body.get("route", "")), bytes.get_string_from_utf8(), bytes,
+			str(body.get("request_id", "")))

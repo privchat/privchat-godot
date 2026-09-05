@@ -49,7 +49,9 @@ if [ ! -f "$NATIVE_DIR/godot-cpp/SConstruct" ]; then
 fi
 
 echo "==> cargo build privchat-sdk-c-api (release)"
-cargo build --release -p privchat-sdk-c-api --manifest-path "$SDK_REPO/Cargo.toml"
+# Run from inside the SDK checkout so its toolchain resolution applies; from
+# elsewhere rustup may pick a toolchain without the cargo component.
+(cd "$SDK_REPO" && cargo build --release -p privchat-sdk-c-api)
 
 echo "==> scons godot-cpp extension"
 cd "$NATIVE_DIR"
