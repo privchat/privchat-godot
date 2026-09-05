@@ -4,10 +4,17 @@
 # (PLATFORM account mode). GDScript port of privchat-cocos
 # src/auth/platform-auth-client.ts — same endpoints, same envelope:
 #
+#   GET  {base_url}/config/bootstrap    → { gateways, auth: { registerModes, ... } }
 #   POST {base_url}/auth/send-sms-code  { mobile, scene: 1 }
 #   POST {base_url}/auth/sms-login      { mobile, smsCode, device }
+#   POST {base_url}/auth/register       { mode: USERNAME_PASSWORD, username, password, nickname?, inviteCode?, device }
+#   POST {base_url}/auth/login-username { username, password, device }
 #   POST {base_url}/auth/refresh-token  { refreshToken, deviceId }
 #
+# Which of PHONE_SMS / USERNAME_PASSWORD a deployment accepts is **server
+# configuration** (privchat.conf [auth], MEMBER_INVITE_CODE_SPEC §5.0): read
+# it from fetch_bootstrap() and render the login form from it — never
+# hard-code a mode in the client.
 # Envelope: { code: 0, message, data }. The returned accessToken is
 # server-signed and works for both HTTP and the IM layer; pass it to
 # PrivchatClient.authenticate(user_id, access_token, device_id).
@@ -23,6 +30,76 @@ var base_url: String = "http://127.0.0.1:8080/app"
 
 func _ready() -> void:
 	base_url = base_url.trim_suffix("/")
+
+
+const MODE_PHONE_SMS := "PHONE_SMS"
+const MODE_USERNAME_PASSWORD := "USERNAME_PASSWORD"
+
+
+## GET /config/bootstrap (anonymous). Returns { ok, error, data } where data is
+## { gateways: Array, features: Dictionary, legal: Dictionary, config_version: String,
+##   register_modes: Array[String], default_register_mode: String,
+##   invite_code_required: bool, nickname_required: bool }.
+## Missing `auth` block (older application) → PHONE_SMS only, the historical default.
+func fetch_bootstrap() -> Dictionary:
+	var resp := await _http_get("/config/bootstrap")
+	if not resp.ok:
+		return resp
+	var data: Dictionary = resp.data
+	var auth: Dictionary = data.get("auth", {}) if typeof(data.get("auth")) == TYPE_DICTIONARY else {}
+	var modes: Array = []
+	for m in auth.get("registerModes", [MODE_PHONE_SMS]):
+		modes.append(str(m).to_upper())
+	if modes.is_empty():
+		modes = [MODE_PHONE_SMS]
+	return { "ok": true, "error": "", "data": {
+		"gateways": data.get("gateways", []),
+		"features": data.get("features", {}),
+		"legal": data.get("legal", {}),
+		"config_version": str(data.get("configVersion", "")),
+		"register_modes": modes,
+		"default_register_mode": str(auth.get("defaultRegisterMode", modes[0])).to_upper(),
+		"invite_code_required": bool(auth.get("inviteCodeRequired", false)),
+		"nickname_required": bool(auth.get("nicknameRequired", false)),
+	} }
+
+
+## POST /auth/register (mode USERNAME_PASSWORD). Same return shape as login_with_sms.
+## username 3-32 chars, password 8-128 (server validation).
+func register_with_username(username: String, password: String, device: Dictionary,
+		nickname: String = "", invite_code: String = "") -> Dictionary:
+	var body := {
+		"mode": MODE_USERNAME_PASSWORD,
+		"username": username,
+		"password": password,
+		"device": device,
+	}
+	if not nickname.is_empty():
+		body["nickname"] = nickname
+	if not invite_code.is_empty():
+		body["inviteCode"] = invite_code
+	var resp := await _post("/auth/register", body)
+	if not resp.ok:
+		return resp
+	var login := _normalize_login_response(resp.data)
+	if login.is_empty():
+		return { "ok": false, "error": "invalid register response: missing user_id/accessToken/refreshToken", "data": {} }
+	return { "ok": true, "error": "", "data": login }
+
+
+## POST /auth/login-username. Same return shape as login_with_sms.
+func login_with_username(username: String, password: String, device: Dictionary) -> Dictionary:
+	var resp := await _post("/auth/login-username", {
+		"username": username,
+		"password": password,
+		"device": device,
+	})
+	if not resp.ok:
+		return resp
+	var login := _normalize_login_response(resp.data)
+	if login.is_empty():
+		return { "ok": false, "error": "invalid login response: missing user_id/accessToken/refreshToken", "data": {} }
+	return { "ok": true, "error": "", "data": login }
 
 
 ## POST /auth/send-sms-code. Returns { ok, error }.
@@ -118,12 +195,19 @@ static func _random_uuid_v4() -> String:
 # ---------------------------------------------------------------------------
 
 func _post(path: String, body: Dictionary) -> Dictionary:
+	return await _request(path, HTTPClient.METHOD_POST, JSON.stringify(body))
+
+
+func _http_get(path: String) -> Dictionary:
+	return await _request(path, HTTPClient.METHOD_GET, "")
+
+
+func _request(path: String, method: int, payload: String) -> Dictionary:
 	var url := base_url + path
 	var http := HTTPRequest.new()
 	http.timeout = DEFAULT_TIMEOUT_MS / 1000.0
 	add_child(http)
-	var err := http.request(url, ["Content-Type: application/json"],
-			HTTPClient.METHOD_POST, JSON.stringify(body))
+	var err := http.request(url, ["Content-Type: application/json"], method, payload)
 	if err != OK:
 		http.queue_free()
 		return { "ok": false, "error": "http request failed: %s" % error_string(err), "data": {} }

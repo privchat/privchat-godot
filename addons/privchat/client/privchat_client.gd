@@ -167,14 +167,41 @@ func stop() -> void:
 		native.shutdown()
 
 
+## 应用侧的启动配置(匿名 GET /config/bootstrap):注册/登录方式、网关、功能开关。
+## 登录界面按 data.register_modes 渲染,而不是猜部署用的是手机号还是账号密码。
+func fetch_bootstrap() -> Dictionary:
+	return await _ensure_auth().fetch_bootstrap()
+
+
 ## Full platform login: sms-login HTTP -> authenticate -> connect.
 ## Returns { ok, error, user_id }.
 func login(mobile: String, sms_code: String) -> Dictionary:
 	if not await _ensure_started():
 		return { "ok": false, "error": "native client init failed", "user_id": -1 }
-
 	var device := PrivchatPlatformAuthClient.default_device_info()
-	var login_resp: Dictionary = await _ensure_auth().login_with_sms(mobile, sms_code, device)
+	return await _finish_login(await _ensure_auth().login_with_sms(mobile, sms_code, device))
+
+
+## 账号密码登录(部署启用 USERNAME_PASSWORD 时):login-username -> authenticate -> connect。
+func login_with_password(username: String, password: String) -> Dictionary:
+	if not await _ensure_started():
+		return { "ok": false, "error": "native client init failed", "user_id": -1 }
+	var device := PrivchatPlatformAuthClient.default_device_info()
+	return await _finish_login(await _ensure_auth().login_with_username(username, password, device))
+
+
+## 账号密码注册并直接登录(服务端注册即签发 token)。
+func register_with_password(username: String, password: String,
+		nickname: String = "", invite_code: String = "") -> Dictionary:
+	if not await _ensure_started():
+		return { "ok": false, "error": "native client init failed", "user_id": -1 }
+	var device := PrivchatPlatformAuthClient.default_device_info()
+	return await _finish_login(await _ensure_auth().register_with_username(
+			username, password, device, nickname, invite_code))
+
+
+## 三种取 token 的方式汇到同一条尾巴:authenticate -> connect -> bootstrap。
+func _finish_login(login_resp: Dictionary) -> Dictionary:
 	if not login_resp.ok:
 		return { "ok": false, "error": login_resp.error, "user_id": -1 }
 	var data: Dictionary = login_resp.data
