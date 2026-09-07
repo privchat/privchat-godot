@@ -316,7 +316,10 @@ struct Encoder {
 
     bool encode_vector(const reflection::Field &field, const Variant &v, flatbuffers::uoffset_t &off) {
         auto et = field.type()->element();
-        if (et == reflection::UByte && v.get_type() == Variant::PACKED_BYTE_ARRAY) {
+        // [ubyte] is raw bytes only when it is not an enum vector: a vector of a
+        // ubyte-backed enum (e.g. [CommandKind]) is a list of names (spec §3.3/§3.4).
+        const bool enum_vector = is_int_type(et) && field.type()->index() >= 0;
+        if (et == reflection::UByte && !enum_vector && v.get_type() == Variant::PACKED_BYTE_ARRAY) {
             PackedByteArray b = v;
             if (int64_t(b.size()) > ctx.max_vector_len) return ctx.err("vector too long");
             off = fbb.CreateVector(b.ptr(), size_t(b.size())).o;
@@ -554,7 +557,8 @@ struct Decoder {
         if (vec == nullptr) return true; // absent -> key omitted
         size_t n = vec->size();
         if (int64_t(n) > ctx.max_vector_len) return ctx.err("vector too long");
-        if (et == reflection::UByte) {
+        const bool enum_vector = is_int_type(et) && field.type()->index() >= 0;
+        if (et == reflection::UByte && !enum_vector) {
             PackedByteArray b; b.resize(int64_t(n));
             if (n > 0) memcpy(b.ptrw(), vec->Data(), n);
             out = b; return true;
