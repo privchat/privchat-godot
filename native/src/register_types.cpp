@@ -1,6 +1,7 @@
 // register_types.cpp
 #include "register_types.h"
 
+#include "privchat_flatbuffers.h"
 #include "privchat_native_client.h"
 
 #include <gdextension_interface.h>
@@ -14,6 +15,8 @@ void initialize_privchat_module(ModuleInitializationLevel p_level) {
         return;
     }
     ClassDB::register_class<PrivchatNativeClient>();
+    ClassDB::register_class<PrivchatFlatBuffersSchema>();
+    ClassDB::register_class<PrivchatFlatBuffers>();
 }
 
 void uninitialize_privchat_module(ModuleInitializationLevel p_level) {

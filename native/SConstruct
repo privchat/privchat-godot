@@ -34,7 +34,11 @@ if not os.path.isfile(os.path.join(SDK_INCLUDE, "privchat_sdk_c_api.h")):
     sys.exit(1)
 
 # 只吃 privchat-sdk-c-api 的 C ABI 头;本扩展不接触 UniFFI 生成物。
-env.Append(CPPPATH=["#src", SDK_INCLUDE])
+# FlatBuffers C++ runtime (header-only + reflection.cpp/util.cpp), vendored
+# at the version pinned in third_party/flatbuffers/VERSION. Used only by the
+# generic PrivchatFlatBuffers codec; no generated business bindings here.
+env.Append(CPPPATH=["#src", "#third_party/flatbuffers/include", SDK_INCLUDE])
+env.Append(CPPDEFINES=["FLATBUFFERS_LOCALE_INDEPENDENT=0"])
 
 if env["platform"] == "macos":
     # Godot engine 4.3+ requires C++17.
@@ -52,7 +56,7 @@ if env["platform"] == "macos":
         target="../addons/privchat/bin/libprivchat_godot.{}.{}.dylib".format(
             env["platform"], env["target"]
         ),
-        source=Glob("src/*.cpp"),
+        source=Glob("src/*.cpp") + Glob("third_party/flatbuffers/src/*.cpp"),
     )
 else:
     print("Only macOS targets are supported in this phase.")

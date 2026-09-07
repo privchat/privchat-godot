@@ -253,9 +253,9 @@ void PrivchatNativeClient::run_task(const Task &task) {
             int32_t rc = privchat_capi_transfer_bytes(c, task.u64_a,
                     task.str_a.c_str(), body_ptr, task.bytes_in.size(),
                     task.u64_b, &envelope_code, &reply);
-            TaskResult r;
-            r.request_id = task.request_id;
-            r.kind = task.kind;
+            // 填外层的 r,不要另起一个:这个 case 曾自带 TaskResult 并自行 push_result,
+            // 之后函数末尾又 push 了一次外层的空 r,同一 request_id 的第二个结果
+            // (ok=false、无数据、无错误)覆盖了第一个,transfer_bytes 于是"无声失败"。
             r.code = rc;
             r.envelope_code = envelope_code;
             if (rc == PRIVCHAT_CAPI_OK) {
@@ -271,9 +271,7 @@ void PrivchatNativeClient::run_task(const Task &task) {
                 r.error = last_error_or("transfer_bytes failed");
             }
             privchat_capi_free_buffer(&reply);
-            push_result(std::move(r));
-            break;
-        }
+        } break;
         case TaskKind::RpcCall: {
             char *out = privchat_capi_rpc_call(c, task.str_a.c_str(), task.str_b.c_str(), timeout_ms);
             if (out != nullptr) {
@@ -441,6 +439,9 @@ void PrivchatNativeClient::drain_results() {
             }
             Dictionary d;
             d["code"] = (int64_t)r.envelope_code;
+            // SDK/C-ABI 层返回码(PRIVCHAT_CAPI_*),与信封 code 分开:信封 0 但
+            // ok=false 时,靠它才知道失败发生在哪一层。
+            d["sdk_code"] = (int64_t)r.code;
             d["data"] = bytes;
             data = d;
         } else if (!r.payload.empty()) {

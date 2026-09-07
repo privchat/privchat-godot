@@ -474,6 +474,7 @@ func transfer_bytes(channel_id: int, route: String, body: PackedByteArray,
 	return {
 		"ok": result.ok,
 		"code": int(envelope.get("code", -1)),
+		"sdk_code": int(envelope.get("sdk_code", 0)),
 		"data": envelope.get("data", PackedByteArray()),
 		"error": str(result.get("error", "")),
 	}
