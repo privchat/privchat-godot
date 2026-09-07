@@ -141,8 +141,13 @@ func _handle_timeline(event: Dictionary) -> void:
 	var body := _event_body(event, "TimelineUpdated")
 	if int(body.get("channel_id", -1)) != channel_id:
 		return
-	# 只把「新消息落库」转成 message_received;sync/回执等 reason 不重复弹消息。
-	if str(body.get("reason", "")) != "realtime_message":
+	# 只把「新消息落库」转成 message_received:
+	#   realtime_message = 对方发来的实时消息;
+	#   local_create     = 本端 send_text 入队时的本地落库(local-first 回显)。
+	# 两者都是"这条消息进了本会话的时间线,该画出来";少了 local_create,自己发的消息
+	# 要等下次重新打开会话读历史才看得见。sync / 回执 / 缩略图等 reason 不重复弹消息。
+	var reason := str(body.get("reason", ""))
+	if reason != "realtime_message" and reason != "local_create":
 		return
 	var message_id: int = int(body.get("message_id", 0))
 	if message_id <= 0:
