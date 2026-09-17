@@ -36,6 +36,8 @@ var room_channel_id: int:
 
 var _sub: PrivchatSubscription = null   # Room 订阅原语(懒建)
 var _seen_timeline := {}       # "channel:message_id" -> true
+var _fetching_timeline: Dictionary = {}
+var _unread_refresh_pending := false
 
 
 func setup(p_client: PrivchatClient) -> void:
@@ -153,15 +155,32 @@ func _handle_timeline(event: Dictionary) -> void:
 	if message_id <= 0:
 		return
 	var key := "%d:%d" % [channel_id, message_id]
-	if _seen_timeline.has(key):
+	if _seen_timeline.has(key) or _fetching_timeline.has(key):
 		return
-	_remember(_seen_timeline, key)
+	# 先占位再取:取失败(重连中超时)就放开,下一次同 id 的事件还能再试;
+	# 取成功才记入 _seen_timeline。原先是先记后取,一次超时就把消息永久吞掉。
+	_fetching_timeline[key] = true
 	var resp: Dictionary = await client.get_message_by_id(message_id)
+	_fetching_timeline.erase(key)
 	# await 期间宿主可能已切场景释放本节点。
-	if not is_instance_valid(self):
+	if not is_inside_tree():
 		return
 	if resp.ok and typeof(resp.data) == TYPE_DICTIONARY:
+		_remember(_seen_timeline, key)
 		message_received.emit(resp.data)
+	_schedule_unread_refresh()
+
+
+## 未读数刷新按帧合并:一阵 20 条/秒的消息不该产生 20 次 RPC。
+func _schedule_unread_refresh() -> void:
+	if _unread_refresh_pending:
+		return
+	_unread_refresh_pending = true
+	if is_inside_tree():
+		await get_tree().process_frame
+	_unread_refresh_pending = false
+	if not is_inside_tree() or client == null or channel_id == 0:
+		return
 	var unread: Dictionary = await client.get_channel_unread_count(channel_id, channel_type)
 	if unread.ok:
 		unread_changed.emit(channel_id, unread.count)

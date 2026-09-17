@@ -109,6 +109,7 @@ private:
     void push_result(TaskResult result);
     void drain_results();
     void poll_events();
+    bool poll_events_once(PrivchatCapiClient *c);
     uint64_t enqueue_task(Task task);
     std::string last_error_or(const char *fallback);
 

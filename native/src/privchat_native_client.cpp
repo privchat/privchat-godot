@@ -1,6 +1,8 @@
 // privchat_native_client.cpp
 #include "privchat_native_client.h"
 
+#include <cstring>
+
 #include <godot_cpp/classes/json.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
@@ -16,7 +18,11 @@ std::string to_std(const String &s) {
 }
 
 constexpr double EVENT_POLL_INTERVAL = 0.05; // seconds
-constexpr uint64_t EVENT_POLL_BATCH = 200;
+// The SDK keeps at most 1024 events (DEFAULT_EVENT_HISTORY_LIMIT) and evicts the
+// oldest silently; draining fewer than that per poll — or not looping when a
+// poll comes back full — is exactly how events get lost during a frame hitch
+// or a reconnect backlog. Pull the whole ring and keep pulling until it runs dry.
+constexpr uint64_t EVENT_POLL_BATCH = 1024;
 
 } // namespace
 
@@ -434,8 +440,8 @@ void PrivchatNativeClient::drain_results() {
             // 二进制应答:绕开 JSON,原样交给 GDScript。
             PackedByteArray bytes;
             bytes.resize((int64_t)r.bytes_out.size());
-            for (size_t i = 0; i < r.bytes_out.size(); i++) {
-                bytes[(int64_t)i] = r.bytes_out[i];
+            if (!r.bytes_out.empty()) {
+                memcpy(bytes.ptrw(), r.bytes_out.data(), r.bytes_out.size());
             }
             Dictionary d;
             d["code"] = (int64_t)r.envelope_code;
@@ -464,7 +470,10 @@ void PrivchatNativeClient::poll_events() {
     if (poll_accumulator < EVENT_POLL_INTERVAL) {
         return;
     }
-    poll_accumulator = 0.0;
+    poll_accumulator -= EVENT_POLL_INTERVAL;
+    if (poll_accumulator > EVENT_POLL_INTERVAL) {
+        poll_accumulator = 0.0; // a long hitch: don't "catch up" with a burst of polls
+    }
 
     PrivchatCapiClient *c = nullptr;
     {
@@ -477,16 +486,25 @@ void PrivchatNativeClient::poll_events() {
     // Unfiltered poll: the SDK's timeline_events_since drops events outside
     // its timeline/network filter sets (e.g. SubscriptionMessageReceived for
     // Room broadcasts), so we poll the full stream and let GDScript match kinds.
+    // Loop while polls come back full so a backlog is drained in one tick.
+    for (int round = 0; round < 8; ++round) {
+        if (!poll_events_once(c)) {
+            break;
+        }
+    }
+}
+
+bool PrivchatNativeClient::poll_events_once(PrivchatCapiClient *c) {
     char *raw = privchat_capi_events_since(c, event_cursor.load(), EVENT_POLL_BATCH);
     if (raw == nullptr) {
-        return;
+        return false;
     }
     String json_text = String::utf8(raw);
     privchat_capi_free_string(raw);
 
     Variant parsed = JSON::parse_string(json_text);
     if (parsed.get_type() != Variant::ARRAY) {
-        return;
+        return false;
     }
     Array events = parsed;
     for (int i = 0; i < events.size(); ++i) {
@@ -495,6 +513,12 @@ void PrivchatNativeClient::poll_events() {
         }
         Dictionary seq_event = events[i];
         int64_t sequence_id = seq_event.get("sequence_id", 0);
+        // Sequence ids are contiguous from 1; a jump means the ring evicted
+        // events we never saw. Report it instead of pretending the stream is whole.
+        const int64_t last = (int64_t)event_cursor.load();
+        if (last > 0 && sequence_id > last + 1) {
+            emit_signal("event_gap", last + 1, sequence_id);
+        }
         int64_t timestamp_ms = seq_event.get("timestamp_ms", 0);
         Variant event_variant = seq_event.get("event", Dictionary());
 
@@ -517,6 +541,7 @@ void PrivchatNativeClient::poll_events() {
         // Already parsed once above — hand the Dictionary straight to GDScript.
         emit_signal("sdk_event", sequence_id, timestamp_ms, kind, seq_event);
     }
+    return (uint64_t)events.size() >= EVENT_POLL_BATCH;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,8 +633,8 @@ uint64_t PrivchatNativeClient::transfer_bytes(uint64_t channel_id, const String 
     t.u64_b = (uint64_t)timeout_ms;
     const int64_t n = body.size();
     t.bytes_in.resize((size_t)n);
-    for (int64_t i = 0; i < n; i++) {
-        t.bytes_in[(size_t)i] = body[i];
+    if (n > 0) {
+        memcpy(t.bytes_in.data(), body.ptr(), (size_t)n);
     }
     return enqueue_task(std::move(t));
 }
@@ -844,6 +869,9 @@ void PrivchatNativeClient::_bind_methods() {
             PropertyInfo(Variant::BOOL, "ok"),
             PropertyInfo(Variant::INT, "message_id"),
             PropertyInfo(Variant::STRING, "error")));
+    ADD_SIGNAL(MethodInfo("event_gap",
+            PropertyInfo(Variant::INT, "expected_sequence_id"),
+            PropertyInfo(Variant::INT, "got_sequence_id")));
     ADD_SIGNAL(MethodInfo("sdk_event",
             PropertyInfo(Variant::INT, "sequence_id"),
             PropertyInfo(Variant::INT, "timestamp_ms"),

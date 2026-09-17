@@ -13,3 +13,4 @@ native/.sconsign.dblite
 
 # macOS noise
 .DS_Store
+native/third_party/**/*.os

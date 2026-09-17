@@ -27,13 +27,25 @@ func _init(p_auth: PrivchatPlatformAuthClient) -> void:
 	auth = p_auth
 
 
-## token_provider 契约实现。member 模块拒绝刷新 = refresh token 失效或
-## 被撤销 → 终态,调用方不应重试。
+## token_provider 契约实现。
+##
+## 只有 member 模块**明确拒绝**(应用错误码)才是终态——refresh token 失效或被撤销,
+## 调用方不应重试。传输错误、非 JSON 响应、服务端内部错误(code 4)都是暂时的:
+## 一次 2 秒的网络抖动不该把手里还有效 refresh token 的用户踢回登录页。
 func refresh(refresh_token_value: String, device_id: String) -> Dictionary:
 	if auth == null:
-		return { "ok": false, "data": {}, "error": "auth client unavailable", "terminal": true }
+		return { "ok": false, "data": {}, "error": "auth client unavailable", "terminal": false }
 	var resp: Dictionary = await auth.refresh_token(refresh_token_value, device_id)
 	if not resp.get("ok", false):
-		return { "ok": false, "data": {}, "error": str(resp.get("error", "refresh failed")),
-				"terminal": true }
+		var error := str(resp.get("error", "refresh failed"))
+		return { "ok": false, "data": {}, "error": error, "terminal": _is_terminal(error) }
 	return { "ok": true, "data": resp.get("data", {}), "error": "", "terminal": false }
+
+
+## PrivchatPlatformAuthClient 把应用层拒绝格式化为 "application code=N: msg";其余
+## 字符串都是传输层/解析层错误。code 4 是 neton 的内部错误,也按暂时处理。
+static func _is_terminal(error: String) -> bool:
+	if not error.begins_with("application code="):
+		return false
+	var code := int(error.substr("application code=".length()).split(":")[0])
+	return code != 0 and code != 4 and code < 500

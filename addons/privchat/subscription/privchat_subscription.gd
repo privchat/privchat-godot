@@ -38,6 +38,8 @@ var channel_id: int = 0
 var channel_type: int = ROOM_CHANNEL_TYPE
 
 var _ticket := ""
+## 最近一次订阅的频道;退订后仍保留,供 transfer_received 过滤(见 _on_transfer_received)。
+var _transfer_channel_id: int = 0
 var _resubscribing := false    # 重订阅 in-flight 闸门(状态抖动不叠加)
 
 
@@ -73,6 +75,7 @@ func subscribe(p_channel_id: int, ticket: String,
 			p_channel_id, p_channel_type, ticket)
 	if resp.ok:
 		channel_id = p_channel_id
+		_transfer_channel_id = p_channel_id
 		channel_type = p_channel_type
 		_ticket = ticket
 	return resp
@@ -81,7 +84,11 @@ func subscribe(p_channel_id: int, ticket: String,
 func unsubscribe() -> Dictionary:
 	if channel_id == 0:
 		return { "ok": true, "data": null, "error": "" }
+	if client == null:
+		return { "ok": false, "data": null, "error": "setup(client) not called" }
 	var resp: Dictionary = await client.unsubscribe_channel(channel_id, channel_type)
+	if not resp.ok:
+		push_warning("[privchat] unsubscribe(%d) rejected: %s (local state cleared anyway)" % [channel_id, str(resp.get("error", ""))])
 	channel_id = 0
 	_ticket = ""
 	return resp
@@ -122,9 +129,7 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 		return
 	var server_message_id: int = int(body.get("server_message_id", 0) \
 			if body.get("server_message_id") != null else 0)
-	var bytes := PackedByteArray()
-	for b in body.get("payload", []):
-		bytes.append(int(b))
+	var bytes := PackedByteArray(body.get("payload", []))
 	message_received.emit(bytes.get_string_from_utf8(), bytes,
 			str(body.get("topic", "") if body.get("topic") != null else ""),
 			str(body.get("publisher", "")), server_message_id,
@@ -132,10 +137,11 @@ func _on_sdk_event(_seq: int, _ts: int, kind: String, event: Dictionary) -> void
 
 
 func _on_transfer_received(body) -> void:
-	if typeof(body) != TYPE_DICTIONARY or int(body.get("channel_id", -1)) != channel_id:
+	# 用 _transfer_channel_id 而不是 channel_id:定向 transfer 不是 Room 订阅的一部分,
+	# unsubscribe() 把 channel_id 清零后,已经发到本端、还排在 SDK 队列里的那几条
+	# PRIVATE 事件不该被当成别的频道丢掉;它只在下一次 subscribe 换频道时才变。
+	if typeof(body) != TYPE_DICTIONARY or int(body.get("channel_id", -1)) != _transfer_channel_id:
 		return
-	var bytes := PackedByteArray()
-	for b in body.get("body", []):
-		bytes.append(int(b))
+	var bytes := PackedByteArray(body.get("body", []))
 	transfer_received.emit(str(body.get("route", "")), bytes.get_string_from_utf8(), bytes,
 			str(body.get("request_id", "")))

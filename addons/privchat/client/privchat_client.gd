@@ -12,6 +12,9 @@ extends Node
 
 ## SDK 事件(event 为已解析的 SequencedSdkEvent Dictionary)。
 signal sdk_event(sequence_id: int, timestamp_ms: int, kind: String, event: Dictionary)
+## SDK 事件序号出现空洞:native 每 50ms 拉一批,SDK 只保留最近 1024 条,来不及拉的
+## 会被淘汰。收到它的宿主应当把依赖事件流的状态视为不可信,拉一次 snapshot。
+signal event_gap(expected_sequence_id: int, got_sequence_id: int)
 signal connection_state_changed(from_state: String, to_state: String)
 signal message_sent(request_id: int, ok: bool, message_id: int, error: String)
 ## 登录态不可自愈(ForcedLogout):宿主须清理登录态并回登录页。
@@ -26,6 +29,8 @@ signal auth_recovered(ok: bool, error: String)
 signal logout_required(code: int, reason: String)
 
 # TaskKind ordinals — must match PrivchatNativeClient::TaskKind.
+# 与 native/src/privchat_native_client.h 的 TaskKind **顺序一致**(它就是枚举序数):
+# 这张表曾经在 TransferBytes 处错位一格,RpcCall 及之后全部偏 1。改枚举必须同步改这里。
 const KIND_AUTHENTICATE := 0
 const KIND_CONNECT := 1
 const KIND_DISCONNECT := 2
@@ -34,18 +39,18 @@ const KIND_SUBSCRIBE := 4
 const KIND_UNSUBSCRIBE := 5
 const KIND_SEND_TEXT := 6
 const KIND_TRANSFER := 7
-const KIND_TRANSFER_BYTES := 19
-const KIND_RPC_CALL := 8
-const KIND_SYNC_CHANNEL := 9
-const KIND_GET_MESSAGE_BY_ID := 10
-const KIND_BOOTSTRAP_SYNC := 11
-const KIND_OPEN_CONVERSATION := 12
-const KIND_LOAD_OLDER_HISTORY := 13
-const KIND_LIST_MESSAGES := 14
-const KIND_LIST_CHANNELS := 15
-const KIND_MARK_READ_TO_PTS := 16
-const KIND_CHANNEL_UNREAD := 17
-const KIND_TOTAL_UNREAD := 18
+const KIND_TRANSFER_BYTES := 8
+const KIND_RPC_CALL := 9
+const KIND_SYNC_CHANNEL := 10
+const KIND_GET_MESSAGE_BY_ID := 11
+const KIND_BOOTSTRAP_SYNC := 12
+const KIND_OPEN_CONVERSATION := 13
+const KIND_LOAD_OLDER_HISTORY := 14
+const KIND_LIST_MESSAGES := 15
+const KIND_LIST_CHANNELS := 16
+const KIND_MARK_READ_TO_PTS := 17
+const KIND_CHANNEL_UNREAD := 18
+const KIND_TOTAL_UNREAD := 19
 
 ## IM server endpoint. Local dev default matches privchat-sdk's own default.
 var server_host: String = "127.0.0.1"
@@ -93,7 +98,9 @@ var token_provider: Callable = Callable()
 
 var _default_provider: PrivchatApplicationAuthProvider = null
 
-var _refreshing := false           # single-flight 闸门
+var _refreshing := false
+var _refresh_started_ms := 0
+const REFRESH_WATCHDOG_MS := 30000           # single-flight 闸门
 var _auth_generation: int = 0      # 登录代际:旧刷新结果不得覆盖新会话
 var _logout_broadcast := false     # 同一代际内 logout_required 只广播一次
 
@@ -138,6 +145,7 @@ func start() -> bool:
 	native.connection_state_changed.connect(_on_connection_state_changed)
 	native.message_sent.connect(_on_message_sent)
 	native.request_completed.connect(_on_request_completed)
+	native.event_gap.connect(func(expected, got): event_gap.emit(expected, got))
 
 	var config := {
 		"endpoints": [{
@@ -158,7 +166,11 @@ func start() -> bool:
 				+ "连接。请设置服务端证书的 SPKI pin(见 spki_pins 注释)。")
 	var ok: bool = native.initialize(config)
 	if not ok:
+		# 失败就把节点收掉:留着一个没起 worker 的 native,后面每个请求都会排队到超时,
+		# 用户看到的是"request timeout"而不是"init failed"。
 		push_error("[privchat] native initialize failed")
+		native.queue_free()
+		native = null
 	return ok
 
 
@@ -252,6 +264,11 @@ func send_sms_code(mobile: String) -> Dictionary:
 ## 返回非空字符串表示应以该错误直接失败。
 ## connect/authenticate 不走本 gate:它们是恢复流程本身,gate 会死锁。
 func _gate_network(timeout_ms: int = 10000) -> String:
+	# 刷新协程可能被宿主释放掉而永不回来(HTTPRequest 节点被父节点 teardown 等),
+	# _refreshing 就会永远为 true、所有网络调用永远被 gate。超时即视为刷新已死。
+	if _refreshing and Time.get_ticks_msec() - _refresh_started_ms > REFRESH_WATCHDOG_MS:
+		push_warning("[privchat] token refresh did not settle within %d ms; releasing the gate" % REFRESH_WATCHDOG_MS)
+		_refreshing = false
 	if not _refreshing:
 		return ""
 	var settled := await await_auth_ready(timeout_ms)
@@ -292,6 +309,7 @@ func refresh_now() -> Dictionary:
 		return { "ok": false, "error": "NO_SESSION", "terminal": true }
 
 	_refreshing = true
+	_refresh_started_ms = Time.get_ticks_msec()
 	var generation := _auth_generation
 	var device_id := logged_in_device_id
 	var result := await _run_refresh(generation, device_id)
@@ -679,7 +697,9 @@ func _await_request_inner(rid: int, timeout_ms: int) -> Dictionary:
 			_abandoned[rid] = true
 			return { "ok": false, "data": null, "error": "request timeout (rid=%d)" % rid }
 		# 节点已被移出场景树(宿主切场景/释放)时不再等待,避免 get_tree() 为 null。
+		# 同样要打上 abandoned,否则迟到的结果会永久留在 _results 里没人读。
 		if not is_inside_tree():
+			_abandoned[rid] = true
 			return { "ok": false, "data": null, "error": "client detached while awaiting" }
 		await get_tree().process_frame
 	var result: Dictionary = _results[rid]
