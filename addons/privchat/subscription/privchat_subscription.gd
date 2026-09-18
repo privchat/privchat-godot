@@ -30,8 +30,11 @@ signal resubscribed(ok: bool, error: String)
 signal transfer_received(route: String, payload_text: String, payload_bytes: PackedByteArray,
 		request_id: String)
 
-## privchat-sdk 的 Room 频道类型(见 spec ROOM_CHANNEL_SPEC)。
-const ROOM_CHANNEL_TYPE := 2
+## Room 频道类型的 **wire** 值(Direct=1 / Group=2 / Room=3,与 privchat-server
+## `ChannelType::to_wire_u8` 一致)。曾经写成 2:老服务端拿 wire 值当 DB 编号
+## (Direct=0/Group=1/Room=2)比对,2 碰巧落到 Room 分支;服务端修正后 2 就是群聊,
+## 订阅会被当成"不是群成员"拒掉。
+const ROOM_CHANNEL_TYPE := 3
 
 var client: PrivchatClient = null
 var channel_id: int = 0
