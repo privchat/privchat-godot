@@ -28,6 +28,10 @@ signal auth_recovered(ok: bool, error: String)
 ## 发出前登录态已清理;**不会**再自动重试,避免无限刷新循环。
 signal logout_required(code: int, reason: String)
 
+## 频道类型的 wire 编号——与 privchat-protocol `protocol::ChannelType` 一致,所有端唯一真源。
+## 没有 0(0 是"未填",服务端拒绝);服务端数据库内部另有 0/1/2 的存储编号,绝不出现在线上。
+enum ChannelType { DIRECT = 1, GROUP = 2, ROOM = 3 }
+
 # TaskKind ordinals — must match PrivchatNativeClient::TaskKind.
 # 与 native/src/privchat_native_client.h 的 TaskKind **顺序一致**(它就是枚举序数):
 # 这张表曾经在 TransferBytes 处错位一格,RpcCall 及之后全部偏 1。改枚举必须同步改这里。

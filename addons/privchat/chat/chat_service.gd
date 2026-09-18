@@ -30,7 +30,7 @@ const SEEN_EVICT := 1024
 
 var client: PrivchatClient = null
 var channel_id: int = 0
-var channel_type: int = 1
+var channel_type: int = PrivchatClient.ChannelType.DIRECT
 var room_channel_id: int:
 	get: return _sub.channel_id if _sub != null else 0
 
